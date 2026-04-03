@@ -1,3 +1,6 @@
 train.bin
 val.bin
 pequellm/
+
+__pycache__/
+*.pyc
