@@ -46,7 +46,7 @@ def graficar_frecuencias_texto(frecuencias, titulo, color):
 
 from tokenizer import MyTokenizer # Tu manual
 from tokenizers import Tokenizer as LibTokenizer # Tu Wiki-50k
-from datasets import load_dataset
+from security_utils import load_dataset_secure
 
 # --- CARGA DE MODELOS ---
 print("Cargando tokenizadores...")
@@ -60,7 +60,7 @@ tk_gpt2 = AutoTokenizer.from_pretrained("gpt2")
 tk_llama = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
 
 # --- MUESTRA DE DATOS ---
-dataset = load_dataset("wikimedia/wikipedia", "20231101.es", split="train", streaming=True, trust_remote_code=True)
+dataset = load_dataset_secure("wikimedia/wikipedia", "20231101.es", split="train", streaming=True)
 muestra = [item["text"] for _, item in zip(range(50), dataset)]
 
 # --- PROCESAMIENTO ---

@@ -1,6 +1,6 @@
-from datasets import load_dataset
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
 import os
+from security_utils import load_dataset_secure
 
 # Desactiva el paralelismo de las librerías de Hugging Face para evitar conflictos de sockets en Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -28,12 +28,11 @@ def train_professional_tokenizer():
         print("Conectando con CulturaX (es)...")
         try:
             # Añadimos un trust_remote_code por seguridad si el dataset lo requiere
-            dataset = load_dataset(
+            dataset = load_dataset_secure(
                 "uonlp/CulturaX", 
                 "es", 
                 split="train", 
-                streaming=True,
-                trust_remote_code=True
+                streaming=True
             )
             
             batch = []

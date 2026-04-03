@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
+import sys
 import numpy as np
-from datasets import load_dataset
 from tokenizers import Tokenizer
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from security_utils import load_dataset_secure, validate_uint16_ids
 
 # 1. Configuración
 TOKENIZER_PATH = "tokenizer-culturax-es-hf.json" # Tu tokenizador de 50k
@@ -14,7 +18,7 @@ def prepare():
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
     
     print("Conectando con CulturaX para preparación binaria...")
-    dataset = load_dataset("uonlp/CulturaX", "es", split="train", streaming=True, trust_remote_code=True)
+    dataset = load_dataset_secure("uonlp/CulturaX", "es", split="train", streaming=True)
     
     # Listas temporales para acumular tokens
     all_tokens = []
@@ -22,6 +26,10 @@ def prepare():
     
     print(f"Iniciando tokenización. Meta: {MAX_TOKENS} tokens.")
     
+    eos_id = tokenizer.token_to_id("</s>")
+    if eos_id is None:
+        raise ValueError("El tokenizador no contiene </s>; no se puede preparar el corpus de entrenamiento.")
+
     try:
         for i, item in enumerate(dataset):
             # Tokenizar el texto
@@ -29,8 +37,8 @@ def prepare():
             ids = tokenizer.encode(text).ids
             
             # Añadir el token de final de secuencia (opcional pero recomendado)
-            # Usamos el ID de </s> que suele ser 2 en tu config de especial tokens
-            ids.append(2) 
+            ids.append(eos_id)
+            validate_uint16_ids(ids, source_name=f"fila {i}")
             
             all_tokens.extend(ids)
             total_tokens += len(ids)

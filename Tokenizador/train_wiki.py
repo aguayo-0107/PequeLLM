@@ -1,6 +1,6 @@
 import os
-from datasets import load_dataset
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+from security_utils import load_dataset_secure
 
 # 1. Limpieza de avisos y configuración de Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -21,13 +21,11 @@ def train_wikipedia_tokenizer():
     # 3. Iterador con el nuevo dataset y permiso de ejecución
     def batch_iterator():
         print("Conectando con Wikipedia en español (versión moderna)...")
-        # Cambiamos a 'wikimedia/wikipedia' y añadimos trust_remote_code=True
-        dataset = load_dataset(
+        dataset = load_dataset_secure(
             "wikimedia/wikipedia", 
             "20231101.es", # Fecha actualizada
             split="train", 
-            streaming=True,
-            trust_remote_code=True # <-- ESTO CORRIGE TU ERROR
+            streaming=True
         )
         
         batch = []

@@ -1,5 +1,8 @@
 import json
 import os
+from pathlib import Path
+
+from security_utils import atomic_write_json
 
 def get_stats(ids):
     counts = {}
@@ -62,13 +65,21 @@ class MyTokenizer:
     def save(self, filename):
         """Guarda los merges en un JSON para no perder el progreso."""
         # JSON no acepta tuplas como llaves, convertimos a string "id1,id2"
-        serializable_merges = {f"{k[0]},{k[1]}": v for k, v in self.merges.items()}
+        merge_ids = list(self.merges.values())
+        if len(merge_ids) != len(set(merge_ids)):
+            raise ValueError("Tokenizer merges contain duplicate token IDs; refusing to save a malformed model.")
+        if merge_ids and (min(merge_ids) < 256 or max(merge_ids) > 65535):
+            raise ValueError("Tokenizer token IDs must stay within the uint16 range before saving.")
+
+        serializable_merges = {
+            f"{k[0]},{k[1]}": v
+            for k, v in sorted(self.merges.items(), key=lambda item: item[1])
+        }
         data = {
             "merges": serializable_merges,
             "vocab_size": len(self.vocab)
         }
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
+        atomic_write_json(Path(filename), data)
         print(f"Modelo guardado en {filename}")
 
     def load(self, filename):
@@ -78,13 +89,45 @@ class MyTokenizer:
             return
         with open(filename, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
+        if not isinstance(data, dict):
+            raise ValueError("El archivo del tokenizador debe contener un objeto JSON válido.")
+        raw_merges = data.get("merges")
+        if not isinstance(raw_merges, dict):
+            raise ValueError("El archivo del tokenizador no contiene una tabla 'merges' válida.")
+
         # Reconstruir merges (convertir "1,2" de nuevo a tupla (1,2))
-        self.merges = {tuple(map(int, k.split(','))): v for k, v in data["merges"].items()}
+        parsed_merges = {}
+        seen_ids = set()
+        for raw_pair, idx in raw_merges.items():
+            if not isinstance(raw_pair, str) or "," not in raw_pair:
+                raise ValueError(f"Par de merge inválido: {raw_pair!r}")
+            if not isinstance(idx, int):
+                raise ValueError(f"ID de merge inválido para {raw_pair!r}: {idx!r}")
+            if idx < 256 or idx > 65535:
+                raise ValueError(f"ID de merge fuera de rango uint16: {idx}")
+
+            p0, p1 = map(int, raw_pair.split(',', 1))
+            parsed_merges[(p0, p1)] = idx
+            if idx in seen_ids:
+                raise ValueError(f"ID de merge duplicado detectado: {idx}")
+            seen_ids.add(idx)
+
+        self.merges = parsed_merges
         # Reconstruir vocabulario
         self.vocab = {i: bytes([i]) for i in range(256)}
-        for (p0, p1), idx in self.merges.items():
+        for (p0, p1), idx in sorted(self.merges.items(), key=lambda item: item[1]):
+            if p0 not in self.vocab or p1 not in self.vocab:
+                raise ValueError(
+                    f"El archivo del tokenizador referencia un merge dependiente inexistente: {(p0, p1)} -> {idx}"
+                )
             self.vocab[idx] = self.vocab[p0] + self.vocab[p1]
+
+        expected_vocab_size = data.get("vocab_size")
+        if expected_vocab_size is not None and expected_vocab_size != len(self.vocab):
+            raise ValueError(
+                f"vocab_size inconsistente: archivo={expected_vocab_size}, reconstruido={len(self.vocab)}"
+            )
         print(f"Modelo cargado: Vocabulario de {len(self.vocab)} tokens.")
 
     def encode(self, text):

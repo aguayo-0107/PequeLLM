@@ -1,7 +1,7 @@
 from tokenizer import MyTokenizer # Tu primer tokenizador
 from tokenizers import Tokenizer as HFTokenizer # El de HuggingFace
-from datasets import load_dataset
 import tokenizer_analytics as ana
+from security_utils import load_dataset_secure
 
 # 1. Cargar ambos modelos
 tk_manual = MyTokenizer()
@@ -11,7 +11,7 @@ tk_hf = HFTokenizer.from_file("tokenizer-culturax-es-hf.json")
 
 # 2. Obtener una muestra de datos para analizar
 print("Cargando muestra de datos...")
-dataset = load_dataset("wikimedia/wikipedia", "20231101.es", split="train", streaming=True, trust_remote_code=True)
+dataset = load_dataset_secure("wikimedia/wikipedia", "20231101.es", split="train", streaming=True)
 muestra_textos = [item["text"] for _, item in zip(range(100), dataset)]
 print(len(muestra_textos))
 

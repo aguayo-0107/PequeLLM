@@ -1,9 +1,8 @@
-from datasets import load_dataset
 from tokenizer import MyTokenizer
-from huggingface_hub import login
 import time
+from security_utils import load_dataset_secure, maybe_login_from_env
 
-login()
+maybe_login_from_env()
 
 def ejecutar_entrenamiento():
     MODEL_FILE = "mi_tokenizador_es.json"
@@ -15,7 +14,7 @@ def ejecutar_entrenamiento():
 
     # 2. Cargar CulturaX (Español) con Streaming
     print("Conectando con CulturaX (es)...")
-    dataset = load_dataset("uonlp/CulturaX", "es", split="train", streaming=True)
+    dataset = load_dataset_secure("uonlp/CulturaX", "es", split="train", streaming=True)
     
     # 3. Tomar una muestra de texto significativa
     # Nota: BPE necesita ver mucho texto. Vamos a tomar las primeras 1000 filas.
