@@ -6,7 +6,7 @@ import numpy as np
 # --- 1. Hiperparámetros de la Arquitectura ---
 BATCH_SIZE = 4       # Secuencias procesadas en paralelo
 BLOCK_SIZE = 8       # Longitud de contexto máximo
-VOCAB_SIZE = 50000   # Tamaño de tu tokenizador
+VOCAB_SIZE = 65536   # Tamaño de tu tokenizador
 N_EMBD = 32          # Dimensión del vector de embedding
 DATA_PATH = "train.bin" # Ruta a tu corpus preparado
 

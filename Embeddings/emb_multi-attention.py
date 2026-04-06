@@ -6,7 +6,7 @@ import numpy as np
 # --- 1. Hiperparámetros de la Arquitectura ---
 BATCH_SIZE = 4       
 BLOCK_SIZE = 8       
-VOCAB_SIZE = 50000   
+VOCAB_SIZE = 65536  
 N_EMBD = 32          
 N_HEAD = 4           # ¡NUEVO! Cantidad de cabezas de atención trabajando en paralelo
 DATA_PATH = "train.bin" 

@@ -7,7 +7,7 @@ import numpy as np
 # Para esta prueba usaremos números pequeños para que corra rápido en tu laptop
 BATCH_SIZE = 4       # Cuántas secuencias procesamos en paralelo
 BLOCK_SIZE = 8       # Longitud de contexto (cuántos tokens ve hacia atrás)
-VOCAB_SIZE = 50000   # El tamaño de tu tokenizador de CulturaX
+VOCAB_SIZE = 65536   # El tamaño de tu tokenizador de CulturaX
 N_EMBD = 32          # Dimensión del vector (en GPT-2 real es 768, aquí usamos 32 para probar)
 DATA_PATH = "train.bin" # La ruta a tu archivo binario
 
