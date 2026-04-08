@@ -10,6 +10,7 @@ Todos los scripts usan PyTorch y leen datos desde `train.bin` con `np.memmap`.
 - Tener instaladas dependencias de `requirements.txt` (al menos `torch`, `numpy`, `tokenizers`).
 - Ejecutar desde la raiz del proyecto para que la ruta `DATA_PATH = "train.bin"` funcione.
 - Para scripts de comparacion: instalar `sentence-transformers`, `scikit-learn` y `matplotlib` si no estan ya en el entorno.
+- Para mixed precision en GPU: usar `--precision auto|bf16|fp16` en `emb_gpt2.py`.
 
 ## Orden recomendado de estudio
 
@@ -21,6 +22,8 @@ Todos los scripts usan PyTorch y leen datos desde `train.bin` con `np.memmap`.
 6. `emb_gpt2.py`
 7. `comparacion_1.py`
 8. `comparacion_2.py`
+9. `GPT2_DIAGNOSTICS.md`
+10. `presentation_report.py`
 
 ## Explicacion de cada archivo
 
@@ -90,14 +93,20 @@ Todos los scripts usan PyTorch y leen datos desde `train.bin` con `np.memmap`.
     - `BLOCK_SIZE = 128`
     - `N_LAYER = 4`
     - `N_HEAD = 6`
-  - Incluye entrenamiento largo (`MAX_ITERS = 25000`) con guardado de checkpoints.
-  - Reanuda automaticamente si existe `pequellm_v2_checkpoint.pth`.
+  - Incluye entrenamiento instrumentado:
+    - train/val loss
+    - norma global de gradiente
+    - norma de gradiente por capa
+    - snapshots UMAP/PCA por iteraciones
+    - heuristica de grokking
+  - Reanuda automaticamente si existe checkpoint (se puede desactivar con `--no-resume`).
   - Al final genera texto con `generate()`.
 - Para que sirve:
-  - Pasar de un prototipo didactico a un entrenamiento mas serio y reproducible.
+  - Pasar de un prototipo didactico a un entrenamiento mas serio, reproducible y medible.
 - Archivos relacionados:
   - Checkpoint esperado: `pequellm_v2_checkpoint.pth`
   - Tokenizador esperado: `tokenizer-culturax-es-hf.json`
+  - Carpeta de resultados: `Embeddings/artifacts_gpt2/<run_name>`
 
 ### `comparacion_1.py`
 
@@ -125,6 +134,25 @@ Todos los scripts usan PyTorch y leen datos desde `train.bin` con `np.memmap`.
 - Para que sirven:
   - Documentar resultados para reportes/presentaciones sin tener que volver a correr scripts.
 
+### `GPT2_DIAGNOSTICS.md`
+
+- Que hace:
+  - Explica como mapear cada requerimiento de analisis (gradientes, UMAP, grokking, etc.) a archivos concretos producidos por `emb_gpt2.py`.
+- Para que sirve:
+  - Tener una guia clara para revisar avances de forma tecnica con su jefe.
+
+### `presentation_report.py`
+
+- Que hace:
+  - Construye automaticamente una presentacion en PDF (estilo diapositivas) con:
+    - resumen ejecutivo
+    - curvas train/val y learning rate
+    - analisis de gradientes (global + por capa)
+    - snapshots UMAP/PCA por iteracion
+    - validacion de embeddings y heuristica de grokking
+- Para que sirve:
+  - Tener material listo para exponer sin armar diapositivas manualmente despues de entrenar.
+
 ## Ejecucion rapida
 
 Desde `C:\Repos\PequeLLM`:
@@ -139,6 +167,22 @@ python Embeddings/emb_gpt2.py
 python Embeddings/comparacion_1.py
 python Embeddings/comparacion_2.py
 ```
+
+Al terminar `emb_gpt2.py`, se genera automaticamente:
+
+- `Embeddings/artifacts_gpt2/<run_name>/<run_name>_presentation.pdf`
+- `Embeddings/artifacts_gpt2/<run_name>/presentation_summary.md`
+
+Tambien puedes regenerar la presentacion de una corrida existente:
+
+```powershell
+python Embeddings/presentation_report.py --run-dir Embeddings/artifacts_gpt2/<run_name>
+```
+
+Nota sobre tipos numericos:
+
+- IDs de tokens: mantener enteros (`uint16` en binario, `int64` al alimentar `nn.Embedding`).
+- Pesos y activaciones del modelo: ahi si conviene usar mixed precision (`fp16`/`bf16`) para rendimiento.
 
 ## Observaciones tecnicas
 

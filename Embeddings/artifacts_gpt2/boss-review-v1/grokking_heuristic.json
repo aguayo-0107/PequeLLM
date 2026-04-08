@@ -1,0 +1,6 @@
+{
+  "grokking_like": false,
+  "val_improvement_after_train_low": 0.042502462364531854,
+  "delay_iters": 15000.0,
+  "probe_gap_gain": 0.0013580690138041973
+}
