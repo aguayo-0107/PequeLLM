@@ -4,3 +4,8 @@ pequellm/
 
 __pycache__/
 *.pyc
+
+# Training/checkpoint artifacts
+Embeddings/artifacts_gpt2/
+*.pth
+*_checkpoint.pth
