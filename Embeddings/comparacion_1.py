@@ -14,7 +14,7 @@ N_EMBD = 32          # O 768 si usaste esa versión
 BLOCK_SIZE = 8       
 N_HEAD = 4           # O 12 si usaste 768
 TOKENIZER_PATH = "tokenizer-culturax-es-hf.json"
-PESOS_PATH = "mi_modelo_undertrained.pth" # El archivo que generaste en el Paso 1
+PESOS_PATH = "pequellm_pesado_checkpoint.pth" # El archivo que generaste en el Paso 1
 MODELO_PRO_NOMBRE = 'paraphrase-multilingual-MiniLM-L12-v2'
 
 palabras_prueba = {

@@ -41,7 +41,7 @@ class TrainConfig:
     n_head: int = 24 # 6
     n_layer: int = 4
 
-    max_iters: int = 25000 # 25000
+    max_iters: int = 100000 # 25000
     eval_interval: int = 500 # 500
     eval_batches: int = 20
     save_interval: int = 500 # 500
@@ -841,6 +841,14 @@ def parse_args() -> TrainConfig:
     cfg.resume = not args.no_resume
     cfg.auto_presentation = not args.skip_presentation
     return cfg
+
+def generate_sample(model: GPTModel, tokenizer: Tokenizer, device: str, cfg: TrainConfig, run_dir: Path) -> None:
+    model.eval()
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    with torch.no_grad():
+        generated_ids = model.generate(context, cfg.generate_tokens)[0].tolist()
+    text = tokenizer.decode(generated_ids)
+    print(f"[INFO] sample generation saved -> {run_dir / 'sample_generation.txt'}")
 
 
 if __name__ == "__main__":
