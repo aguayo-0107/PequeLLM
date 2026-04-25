@@ -1,0 +1,45 @@
+.git/
+.gitignore
+.gitattributes
+.claude/
+openspec/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large generated artifacts: must come from the persistent volume, not the image
+train.bin
+val.bin
+*.pth
+*_checkpoint.pth
+Embeddings/artifacts_gpt2/
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Existing prebuilt tokenizers stay tracked in git but do NOT need to enter
+# the build context; they are read from the bind-mounted repo at runtime.
+mi_tokenizador_es.json
+tokenizer-culturax-es-hf.json
+tokenizer-wiki-es-50k.json
+
+# Documentation that has no role in the image
+docs/
+*.md
+!CLAUDE.md
