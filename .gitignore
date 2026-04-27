@@ -9,3 +9,8 @@ __pycache__/
 Embeddings/artifacts_gpt2/
 *.pth
 *_checkpoint.pth
+
+# Herramientas locales de desarrollo (no se versionan)
+.claude/
+CLAUDE.md
+openspec/
