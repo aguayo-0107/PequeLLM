@@ -79,6 +79,7 @@ common_run_args=(
     -w /workspace/repo
     -e HF_HOME=/workspace/cache
     -e PYTHONUNBUFFERED=1
+    -e HF_TOKEN="${HF_TOKEN:-}"
 )
 
 # Anadimos -it si stdout es un terminal, sino solo -i (ej. en logs/CI).
