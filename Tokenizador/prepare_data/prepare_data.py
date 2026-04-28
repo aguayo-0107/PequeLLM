@@ -8,7 +8,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from security_utils import load_dataset_secure, validate_uint16_ids
 
 # 1. Configuración
-TOKENIZER_PATH = "tokenizer-culturax-es-hf.json" # Tu tokenizador de 50k
+TOKENIZER_PATH = str(Path(__file__).resolve().parents[2] / "tokenizer-culturax-es-hf.json" # Tu tokenizador de 50k
 MAX_TOKENS = 250_000_000  # ~500MB en disco (2 bytes por token)
 TRAIN_BIN_PATH = "train.bin"
 VAL_BIN_PATH = "val.bin"
