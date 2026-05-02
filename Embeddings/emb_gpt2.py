@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover - optional dependency in runtime
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EMB_DIR = Path(__file__).resolve().parent
 
-
+# Aumentar cantidad de PROBE_WORDS
 PROBE_WORDS = {
     "personas": ["hombre", "mujer", "padre", "madre", "nino", "nina"],
     "tiempo_vida": ["mundo", "vida", "tiempo", "ano", "dia", "noche"],
@@ -230,14 +230,23 @@ def resolve_amp_settings(cfg: TrainConfig, device: str) -> AmpSettings:
     return AmpSettings(enabled=True, device_type="cuda", dtype=torch.float16, use_grad_scaler=True)
 
 
-def get_lr(step: int, cfg: TrainConfig) -> float:
-    if cfg.max_iters <= 0:
+def get_lr(step: int, cfg: TrainConfig, start_iter: int = 0) -> float:
+    total_iters = cfg.max_iters
+    if total_iters <= 0:
         return cfg.lr_min
-    if step < cfg.warmup_iters:
-        return cfg.lr_max * float(step + 1) / float(max(1, cfg.warmup_iters))
-    if step >= cfg.max_iters:
+
+    # Warmup relativo al inicio del entrenamiento actual
+    relative_step = step - start_iter
+    warmup_end = start_iter + cfg.warmup_iters
+
+    if step < warmup_end:
+        progress = float(relative_step + 1) / float(max(1, cfg.warmup_iters))
+        return cfg.lr_max * progress
+
+    if step >= total_iters:
         return cfg.lr_min
-    decay_ratio = (step - cfg.warmup_iters) / float(max(1, cfg.max_iters - cfg.warmup_iters))
+
+    decay_ratio = (step - warmup_end) / float(max(1, total_iters - warmup_end))
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return cfg.lr_min + coeff * (cfg.lr_max - cfg.lr_min)
 
@@ -292,6 +301,83 @@ def collect_layer_grad_norms(model: nn.Module) -> Dict[str, float]:
         layer_sumsq[layer_name] = layer_sumsq.get(layer_name, 0.0) + float(torch.sum(grad * grad).item())
     return {name: math.sqrt(value) for name, value in layer_sumsq.items()}
 
+# Métricas adicionales para replicar experimento GPT-2
+def compute_perplexity(loss: float) -> float:
+    """Perplexity = e^loss. Métrica estándar en NLP. Más interpretable que el loss crudo.
+    Un modelo que predice al azar sobre 65536 tokens tendría perplexity=65536.
+    El GPT-2 original logró ~35 en WebText en inglés."""
+    if math.isnan(loss):
+        return float("nan")
+    return math.exp(min(loss, 20.0))  # cap para evitar overflow con losses muy altos
+
+
+def compute_bits_per_character(loss: float, chars_per_token: float = 4.5) -> float:
+    """Bits por caracter = loss / ln(2) / chars_per_token.
+    Mide qué tan bien comprime el modelo el texto.
+    GPT-2 logró ~0.86 bpc en inglés. En español esperamos algo más alto.
+    chars_per_token=4.5 es una estimación razonable para español con tokenizador BPE de 50k."""
+    if math.isnan(loss):
+        return float("nan")
+    return loss / math.log(2) / chars_per_token
+
+
+def compute_tokens_per_second(elapsed_s: float, batch_size: int, block_size: int) -> float:
+    """Tokens procesados por segundo durante el intervalo de eval.
+    Útil para comparar eficiencia entre corridas y detectar throttling de GPU."""
+    if elapsed_s <= 0:
+        return float("nan")
+    return (batch_size * block_size) / elapsed_s
+
+
+def compute_param_norm(model: nn.Module) -> float:
+    """Norma L2 total de todos los parámetros del modelo.
+    Si crece sin control puede indicar que el modelo está 'explotando' silenciosamente
+    a pesar del grad_clip (que solo controla gradientes, no los pesos mismos)."""
+    total_sq = 0.0
+    for param in model.parameters():
+        total_sq += float(param.detach().float().pow(2).sum().item())
+    return math.sqrt(total_sq)
+
+
+def compute_grad_norm_ratio(current_norm: float, norm_history: List[float]) -> float:
+    """Ratio entre el grad_norm actual y el promedio histórico de las últimas N evals.
+    Un ratio > 3 indica un spike de gradiente que puede desestabilizar el entrenamiento.
+    Útil para detectar problemas que grad_clip no alcanza a suavizar."""
+    if not norm_history or math.isnan(current_norm):
+        return float("nan")
+    avg = float(np.mean([n for n in norm_history if not math.isnan(n)]))
+    if avg < 1e-8:
+        return float("nan")
+    return current_norm / avg
+
+
+def compute_embedding_stats(model: GPTModel) -> Dict[str, float]:
+    """Norma promedio y desviación estándar de todos los vectores de embedding.
+    - norm_mean: debe crecer gradualmente conforme el modelo aprende.
+      Si se queda plano, los embeddings no se están actualizando.
+    - norm_std: si es muy alta, algunos tokens dominan el espacio vectorial
+      y otros son ignorados (problema de tokens raros)."""
+    emb = model.token_embedding_table.weight.detach().float()
+    norms = emb.norm(dim=1)  # norma de cada vector de token
+    return {
+        "emb_norm_mean": float(norms.mean().item()),
+        "emb_norm_std": float(norms.std().item()),
+        "emb_norm_min": float(norms.min().item()),
+        "emb_norm_max": float(norms.max().item()),
+    }
+
+
+def count_loss_spikes(history: List[Dict[str, float]], threshold: float = 0.05) -> int:
+    """Cuenta cuántas veces el val_loss subió más de `threshold` entre dos evals consecutivas.
+    Spikes frecuentes indican inestabilidad en el entrenamiento."""
+    spikes = 0
+    for i in range(1, len(history)):
+        prev = history[i - 1]["val_loss"]
+        curr = history[i]["val_loss"]
+        if not math.isnan(prev) and not math.isnan(curr):
+            if (curr - prev) / max(abs(prev), 1e-8) > threshold:
+                spikes += 1
+    return spikes
 
 def reduce_to_2d(vectors: np.ndarray, random_state: int) -> Tuple[np.ndarray, str]:
     try:
@@ -305,12 +391,13 @@ def reduce_to_2d(vectors: np.ndarray, random_state: int) -> Tuple[np.ndarray, st
             random_state=random_state,
         )
         return reducer.fit_transform(vectors), "umap"
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] UMAP falló ({e}), cayendo a PCA.")
         try:
             from sklearn.decomposition import PCA
-
             return PCA(n_components=2, random_state=random_state).fit_transform(vectors), "pca_fallback"
-        except Exception:
+        except Exception as e2:
+            print(f"[WARN] PCA también falló ({e2}), usando primeras 2 dimensiones.")
             if vectors.shape[1] >= 2:
                 return vectors[:, :2], "raw2d_fallback"
             pad = np.zeros((vectors.shape[0], 2), dtype=vectors.dtype)
@@ -318,29 +405,112 @@ def reduce_to_2d(vectors: np.ndarray, random_state: int) -> Tuple[np.ndarray, st
             return pad, "raw2d_fallback"
 
 
-def save_umap_snapshot(model: GPTModel, sample_ids: np.ndarray, iteration: int, out_dir: Path, random_state: int) -> str:
+def save_umap_snapshot(
+    model: GPTModel,
+    sample_ids: np.ndarray,
+    iteration: int,
+    out_dir: Path,
+    random_state: int,
+    tokenizer: Tokenizer | None = None,
+) -> str:
+    """
+    Genera un snapshot UMAP de los embeddings.
+
+    Mejoras vs versión original:
+    - Usa PROBE_WORDS como anclas etiquetadas y coloreadas por categoría semántica.
+    - Rellena el resto con tokens del sample aleatorio pintados en gris (fondo).
+    - Guarda columnas 'category' y 'word' en el CSV para análisis posterior.
+    - Si el tokenizer no está disponible, cae al comportamiento original.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     emb = model.token_embedding_table.weight.detach().cpu().numpy()
-    sampled = emb[sample_ids]
+
+    # --- Construir anclas etiquetadas desde PROBE_WORDS ---
+    labeled_ids: List[int] = []
+    labeled_categories: List[str] = []
+    labeled_words: List[str] = []
+
+    if tokenizer is not None:
+        for category, words in PROBE_WORDS.items():
+            for word in words:
+                ids = tokenizer.encode(word).ids
+                if ids:
+                    # Usar solo el primer token de la palabra
+                    labeled_ids.append(ids[0])
+                    labeled_categories.append(category)
+                    labeled_words.append(word)
+
+    if not labeled_ids:
+        # Sin tokenizer o sin matches: comportamiento original sin etiquetas
+        print(f"[WARN] UMAP: no se encontraron tokens de PROBE_WORDS, usando solo sample aleatorio.")
+
+    # --- Combinar: anclas etiquetadas + fondo aleatorio (sin duplicar) ---
+    labeled_set = set(labeled_ids)
+    background_ids = [int(sid) for sid in sample_ids if int(sid) not in labeled_set]
+
+    all_ids = labeled_ids + background_ids
+    all_categories = labeled_categories + ["otros"] * len(background_ids)
+    all_words = labeled_words + [""] * len(background_ids)
+
+    sampled = emb[all_ids]
     coords, method = reduce_to_2d(sampled, random_state=random_state)
 
+    # --- Guardar CSV con etiquetas ---
     csv_path = out_dir / f"umap_tokens_iter_{iteration:06d}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["token_id", "x", "y", "method"])
-        for idx, (x, y) in zip(sample_ids.tolist(), coords.tolist()):
-            writer.writerow([idx, x, y, method])
+        writer.writerow(["token_id", "x", "y", "method", "category", "word"])
+        for tid, cat, word, (x, y) in zip(all_ids, all_categories, all_words, coords.tolist()):
+            writer.writerow([tid, x, y, method, cat, word])
 
+    # --- Graficar con colores por categoría ---
     if plt is not None:
-        fig = plt.figure(figsize=(8, 6))
-        ax = fig.add_subplot(111)
-        ax.scatter(coords[:, 0], coords[:, 1], s=8, alpha=0.65)
-        ax.set_title(f"Token embedding projection at iter={iteration} ({method})")
+        CATEGORY_COLORS = {
+            "personas":    "#e74c3c",   # rojo
+            "tiempo_vida": "#2ecc71",   # verde
+            "verbos":      "#3498db",   # azul
+            "otros":       "#bdc3c7",   # gris claro
+        }
+
+        coords_arr = np.array(coords) if not isinstance(coords, np.ndarray) else coords
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Primero el fondo gris para que no tape las anclas
+        bg_mask = [i for i, c in enumerate(all_categories) if c == "otros"]
+        if bg_mask:
+            bg_coords = coords_arr[bg_mask]
+            ax.scatter(bg_coords[:, 0], bg_coords[:, 1],
+                       s=6, alpha=0.25, color=CATEGORY_COLORS["otros"], label="otros", zorder=1)
+
+        # Luego las categorías etiquetadas encima
+        for category in PROBE_WORDS.keys():
+            cat_mask = [i for i, c in enumerate(all_categories) if c == category]
+            if not cat_mask:
+                continue
+            cat_coords = coords_arr[cat_mask]
+            color = CATEGORY_COLORS.get(category, "#9b59b6")
+            ax.scatter(cat_coords[:, 0], cat_coords[:, 1],
+                       s=80, alpha=0.95, color=color, label=category,
+                       edgecolors="white", linewidths=0.5, zorder=5)
+            # Anotar cada palabra
+            for i, mask_i in enumerate(cat_mask):
+                ax.annotate(
+                    all_words[mask_i],
+                    (coords_arr[mask_i, 0], coords_arr[mask_i, 1]),
+                    fontsize=7, ha="center", va="bottom",
+                    color=color, fontweight="bold",
+                )
+
+        ax.set_title(f"Token embedding projection — iter={iteration} ({method})", fontsize=13)
         ax.set_xlabel("axis_1")
         ax.set_ylabel("axis_2")
+        ax.legend(loc="upper right", fontsize=9)
         fig.tight_layout()
         fig.savefig(out_dir / f"umap_tokens_iter_{iteration:06d}.png", dpi=160)
         plt.close(fig)
+
+    n_labeled = len(labeled_ids)
+    print(f"[INFO] UMAP snapshot guardado en iter={iteration} método={method} anclas={n_labeled}")
     return method
 
 
@@ -503,26 +673,28 @@ class MetricsLogger:
         self.grad_path = self.run_dir / "grad_norms_by_layer.csv"
         self.validation_path = self.run_dir / "config_validation.json"
 
-        with self.train_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "iter",
-                    "train_loss",
-                    "val_loss",
-                    "lr",
-                    "global_grad_norm",
-                    "probe_intra_cos",
-                    "probe_inter_cos",
-                    "probe_gap",
-                    "probe_knn_purity",
+        # Solo escribe el header si el archivo no existe todavía
+        if not self.train_path.exists():
+            with self.train_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "iter", "train_loss", "val_loss", "lr", "global_grad_norm",
+                    "probe_intra_cos", "probe_inter_cos", "probe_gap", "probe_knn_purity",
                     "umap_method",
-                ]
-            )
+                    # Nuevas métricas GPT-2
+                    "perplexity", "bits_per_char", "tokens_per_sec",
+                    "param_norm", "grad_norm_ratio", "loss_spike_count",
+                    "emb_norm_mean", "emb_norm_std", "emb_norm_min", "emb_norm_max",
+                ])
+        else:
+            print(f"[INFO] MetricsLogger: train_metrics.csv existente, continuando en modo append.")
 
-        with self.grad_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["iter", "layer_name", "grad_norm", "delta_vs_prev"])
+        if not self.grad_path.exists():
+            with self.grad_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["iter", "layer_name", "grad_norm", "delta_vs_prev"])
+        else:
+            print(f"[INFO] MetricsLogger: grad_norms_by_layer.csv existente, continuando en modo append.")
 
     def write_validation(self, validation: Dict[str, str]) -> None:
         self.validation_path.write_text(json.dumps(validation, indent=2), encoding="utf-8")
@@ -536,23 +708,26 @@ class MetricsLogger:
         global_grad_norm: float,
         probe: Dict[str, float],
         umap_method: str,
+        extra: Dict[str, float] | None = None,
     ) -> None:
+        ex = extra or {}
         with self.train_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                [
-                    iteration,
-                    train_loss,
-                    val_loss,
-                    lr,
-                    global_grad_norm,
-                    probe["probe_intra_cos"],
-                    probe["probe_inter_cos"],
-                    probe["probe_gap"],
-                    probe["probe_knn_purity"],
-                    umap_method,
-                ]
-            )
+            writer.writerow([
+                iteration, train_loss, val_loss, lr, global_grad_norm,
+                probe["probe_intra_cos"], probe["probe_inter_cos"],
+                probe["probe_gap"], probe["probe_knn_purity"], umap_method,
+                ex.get("perplexity", float("nan")),
+                ex.get("bits_per_char", float("nan")),
+                ex.get("tokens_per_sec", float("nan")),
+                ex.get("param_norm", float("nan")),
+                ex.get("grad_norm_ratio", float("nan")),
+                ex.get("loss_spike_count", float("nan")),
+                ex.get("emb_norm_mean", float("nan")),
+                ex.get("emb_norm_std", float("nan")),
+                ex.get("emb_norm_min", float("nan")),
+                ex.get("emb_norm_max", float("nan")),
+            ])
 
     def log_gradients(self, iteration: int, current: Dict[str, float], previous: Dict[str, float]) -> None:
         with self.grad_path.open("a", newline="", encoding="utf-8") as f:
@@ -593,6 +768,28 @@ def maybe_load_checkpoint(
     model.load_state_dict(raw)
     return 0, None
 
+def load_history_from_csv(train_path: Path) -> List[Dict[str, float]]:
+    """Reconstruye el historial de métricas desde el CSV al resumir.
+    Esto permite que detect_grokking_like tenga el historial completo
+    aunque el proceso haya sido interrumpido y reiniciado varias veces."""
+    if not train_path.exists():
+        return []
+    history = []
+    with train_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                history.append({
+                    "iter": float(row["iter"]),
+                    "train_loss": float(row["train_loss"]),
+                    "val_loss": float(row["val_loss"]),
+                    "probe_gap": float(row.get("probe_gap", "nan")),
+                })
+            except (KeyError, ValueError):
+                continue
+    if history:
+        print(f"[INFO] Historial recargado desde CSV: {len(history)} entradas (iter {int(history[0]['iter'])}→{int(history[-1]['iter'])})")
+    return history
 
 def build_run_dir(output_root: Path, run_name: str) -> Path:
     if run_name:
@@ -625,6 +822,14 @@ def train(cfg: TrainConfig) -> None:
     checkpoint_path = Path(cfg.checkpoint_path)
     start_iter, restored_run = maybe_load_checkpoint(checkpoint_path, model, optimizer, cfg.resume, device)
     run_dir = restored_run if restored_run is not None else build_run_dir(Path(cfg.output_root), cfg.run_name)
+
+    # Ajustar max_iters al resumir para que el schedule LR sea correcto.
+    # Si start_iter=99999 y max_iters=100000, el nuevo techo es 199999.
+    # Esto evita que get_lr retorne siempre lr_min durante la segunda corrida.
+    if start_iter > 0:
+        cfg.max_iters = start_iter + cfg.max_iters
+        print(f"[INFO] Resume detectado: max_iters ajustado a {cfg.max_iters} (start={start_iter})")
+
     logger = MetricsLogger(run_dir)
 
     validation = validate_embedding_size(cfg)
@@ -646,18 +851,23 @@ def train(cfg: TrainConfig) -> None:
     sample_size = min(cfg.umap_sample_size, cfg.vocab_size)
     sample_ids = np.random.default_rng(cfg.seed).choice(cfg.vocab_size, size=sample_size, replace=False)
     prev_grad_norms: Dict[str, float] = {}
-    history: List[Dict[str, float]] = []
+    grad_norm_history: List[float] = []  # para compute_grad_norm_ratio
+
+    # Recargar historial desde CSV si estamos resumiendo
+    history: List[Dict[str, float]] = load_history_from_csv(logger.train_path)
+
     last_train_loss = float("nan")
     last_global_grad_norm = float("nan")
 
     model.train()
     timer = time.time()
+
     for iteration in range(start_iter, cfg.max_iters):
         xb, yb = train_ds.get_batch(cfg.block_size, cfg.batch_size)
         xb = xb.to(device)
         yb = yb.to(device)
 
-        lr = get_lr(iteration, cfg)
+        lr = get_lr(iteration, cfg, start_iter=start_iter)
         for group in optimizer.param_groups:
             group["lr"] = lr
 
@@ -668,6 +878,7 @@ def train(cfg: TrainConfig) -> None:
             enabled=amp.enabled,
         ):
             _, loss = model(xb, yb)
+
         if loss is None:
             raise RuntimeError("Loss became None during training.")
 
@@ -675,20 +886,25 @@ def train(cfg: TrainConfig) -> None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             global_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+            if iteration % cfg.grad_log_interval == 0:
+                grad_norms = collect_layer_grad_norms(model)
+                logger.log_gradients(iteration, grad_norms, prev_grad_norms)
+                prev_grad_norms = grad_norms
+
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
             global_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+            if iteration % cfg.grad_log_interval == 0:
+                grad_norms = collect_layer_grad_norms(model)
+                logger.log_gradients(iteration, grad_norms, prev_grad_norms)
+                prev_grad_norms = grad_norms
+
             optimizer.step()
 
         last_train_loss = float(loss.item())
         last_global_grad_norm = global_grad_norm
-
-        if iteration % cfg.grad_log_interval == 0:
-            grad_norms = collect_layer_grad_norms(model)
-            logger.log_gradients(iteration, grad_norms, prev_grad_norms)
-            prev_grad_norms = grad_norms
 
         should_eval = (iteration % cfg.eval_interval == 0) or (iteration == cfg.max_iters - 1)
         if should_eval:
@@ -703,7 +919,42 @@ def train(cfg: TrainConfig) -> None:
                     iteration=iteration,
                     out_dir=run_dir / "umap_snapshots",
                     random_state=cfg.umap_random_state,
+                    tokenizer=tokenizer,
                 )
+
+            # --- Nuevas métricas ---
+            perplexity      = compute_perplexity(val_loss)
+            bits_per_char   = compute_bits_per_character(val_loss)
+            param_norm      = compute_param_norm(model)
+            emb_stats       = compute_embedding_stats(model)
+            grad_norm_ratio = compute_grad_norm_ratio(last_global_grad_norm, grad_norm_history)
+            grad_norm_history.append(last_global_grad_norm)
+            if len(grad_norm_history) > 50:        # ventana de 50 evals
+                grad_norm_history.pop(0)
+
+            # Actualizar historial ANTES de contar spikes para incluir este punto
+            history.append({
+                "iter": float(iteration),
+                "train_loss": last_train_loss,
+                "val_loss": val_loss,
+                "probe_gap": probe_metrics["probe_gap"],
+            })
+            spike_count = count_loss_spikes(history)
+
+            # tokens/sec: cuántos tokens procesó la GPU en el intervalo de eval
+            elapsed = time.time() - timer
+            tps = compute_tokens_per_second(elapsed, cfg.batch_size, cfg.block_size)
+            timer = time.time()
+
+            extra_metrics = {
+                "perplexity":      perplexity,
+                "bits_per_char":   bits_per_char,
+                "tokens_per_sec":  tps,
+                "param_norm":      param_norm,
+                "grad_norm_ratio": grad_norm_ratio,
+                "loss_spike_count": float(spike_count),
+                **emb_stats,
+            }
 
             logger.log_train(
                 iteration=iteration,
@@ -713,25 +964,24 @@ def train(cfg: TrainConfig) -> None:
                 global_grad_norm=last_global_grad_norm,
                 probe=probe_metrics,
                 umap_method=umap_method,
-            )
-            history.append(
-                {
-                    "iter": float(iteration),
-                    "train_loss": last_train_loss,
-                    "val_loss": val_loss,
-                    "probe_gap": probe_metrics["probe_gap"],
-                }
+                extra=extra_metrics,
             )
 
-            elapsed = time.time() - timer
-            timer = time.time()
             print(
                 f"[iter {iteration:06d}] "
                 f"train_loss={last_train_loss:.4f} "
                 f"val_loss={val_loss:.4f} "
+                f"ppl={perplexity:.1f} "
+                f"bpc={bits_per_char:.4f} "
                 f"lr={lr:.2e} "
-                f"global_grad_norm={last_global_grad_norm:.4f} "
+                f"grad_norm={last_global_grad_norm:.4f} "
+                f"grad_ratio={grad_norm_ratio:.2f} "
+                f"param_norm={param_norm:.1f} "
+                f"emb_mean={emb_stats['emb_norm_mean']:.4f} "
+                f"emb_std={emb_stats['emb_norm_std']:.4f} "
+                f"spikes={spike_count} "
                 f"probe_gap={probe_metrics['probe_gap']:.4f} "
+                f"tps={tps:.0f} "
                 f"umap={umap_method} "
                 f"dt={elapsed:.2f}s"
             )
@@ -767,9 +1017,11 @@ def train(cfg: TrainConfig) -> None:
         with torch.no_grad():
             generated_ids = model.generate(context, cfg.generate_tokens)[0].tolist()
         text = tokenizer.decode(generated_ids)
-        (run_dir / "sample_generation.txt").write_text(text, encoding="utf-8")
-        print(f"[INFO] sample generation saved -> {run_dir / 'sample_generation.txt'}")
-
+        gen_path = run_dir / "sample_generation.txt"
+        gen_path.write_text(text, encoding="utf-8")
+        print(f"[INFO] sample generation saved -> {gen_path}")
+        print(f"[INFO] sample: {text[:200]}")
+        
     if cfg.auto_presentation:
         try:
             from presentation_report import generate_presentation
@@ -841,14 +1093,6 @@ def parse_args() -> TrainConfig:
     cfg.resume = not args.no_resume
     cfg.auto_presentation = not args.skip_presentation
     return cfg
-
-def generate_sample(model: GPTModel, tokenizer: Tokenizer, device: str, cfg: TrainConfig, run_dir: Path) -> None:
-    model.eval()
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    with torch.no_grad():
-        generated_ids = model.generate(context, cfg.generate_tokens)[0].tolist()
-    text = tokenizer.decode(generated_ids)
-    print(f"[INFO] sample generation saved -> {run_dir / 'sample_generation.txt'}")
 
 
 if __name__ == "__main__":
