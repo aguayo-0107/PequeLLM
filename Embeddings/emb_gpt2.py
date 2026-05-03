@@ -481,11 +481,11 @@ def save_umap_snapshot(
     # --- Combinar: anclas etiquetadas + fondo aleatorio (sin duplicar) ---
     labeled_set = set(labeled_ids)
     background_ids = [int(sid) for sid in sample_ids if int(sid) not in labeled_set]
-
+ 
     all_ids = labeled_ids + background_ids
     all_categories = labeled_categories + ["otros"] * len(background_ids)
     all_words = labeled_words + [""] * len(background_ids)
-
+ 
     sampled = emb[all_ids]
     coords, method = reduce_to_2d(sampled, random_state=random_state)
 
@@ -500,22 +500,29 @@ def save_umap_snapshot(
     # --- Graficar con colores por categoría ---
     if plt is not None:
         CATEGORY_COLORS = {
-            "personas":    "#e74c3c",   # rojo
-            "tiempo_vida": "#2ecc71",   # verde
-            "verbos":      "#3498db",   # azul
-            "otros":       "#bdc3c7",   # gris claro
+            "personas":      "#e74c3c",   # rojo
+            "verbos_ser":    "#3498db",   # azul
+            "verbos_accion": "#2ecc71",   # verde
+            "numeros":       "#f39c12",   # naranja
+            "colores":       "#9b59b6",   # morado
+            "lugares":       "#1abc9c",   # turquesa
+            "tiempo":        "#e67e22",   # naranja oscuro
+            "emociones":     "#e91e8c",   # rosa fuerte
+            "naturaleza":    "#27ae60",   # verde oscuro
+            "abstractos":    "#2c3e50",   # gris oscuro
+            "otros":         "#bdc3c7",   # gris claro
         }
 
         coords_arr = np.array(coords) if not isinstance(coords, np.ndarray) else coords
         fig, ax = plt.subplots(figsize=(10, 8))
-
+ 
         # Primero el fondo gris para que no tape las anclas
         bg_mask = [i for i, c in enumerate(all_categories) if c == "otros"]
         if bg_mask:
             bg_coords = coords_arr[bg_mask]
             ax.scatter(bg_coords[:, 0], bg_coords[:, 1],
                        s=6, alpha=0.25, color=CATEGORY_COLORS["otros"], label="otros", zorder=1)
-
+ 
         # Luego las categorías etiquetadas encima
         for category in PROBE_WORDS.keys():
             cat_mask = [i for i, c in enumerate(all_categories) if c == category]
@@ -534,7 +541,7 @@ def save_umap_snapshot(
                     fontsize=7, ha="center", va="bottom",
                     color=color, fontweight="bold",
                 )
-
+ 
         ax.set_title(f"Token embedding projection — iter={iteration} ({method})", fontsize=13)
         ax.set_xlabel("axis_1")
         ax.set_ylabel("axis_2")
@@ -542,7 +549,7 @@ def save_umap_snapshot(
         fig.tight_layout()
         fig.savefig(out_dir / f"umap_tokens_iter_{iteration:06d}.png", dpi=160)
         plt.close(fig)
-
+ 
     n_labeled = len(labeled_ids)
     print(f"[INFO] UMAP snapshot guardado en iter={iteration} método={method} anclas={n_labeled}")
     return method
