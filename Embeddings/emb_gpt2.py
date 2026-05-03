@@ -24,11 +24,27 @@ except Exception:  # pragma: no cover - optional dependency in runtime
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EMB_DIR = Path(__file__).resolve().parent
 
-# Aumentar cantidad de PROBE_WORDS
 PROBE_WORDS = {
-    "personas": ["hombre", "mujer", "padre", "madre", "nino", "nina"],
-    "tiempo_vida": ["mundo", "vida", "tiempo", "ano", "dia", "noche"],
-    "verbos": ["dijo", "fue", "era", "tiene", "hace", "esta"],
+    "personas":      ["hombre", "mujer", "padre", "madre", "hijo", "hija",
+                      "niño", "niña", "abuelo", "abuela", "hermano", "hermana"],
+    "verbos_ser":    ["es", "era", "fue", "sido", "sera", "siendo",
+                      "esta", "estaba", "estuvo", "estara"],
+    "verbos_accion": ["dijo", "hace", "tiene", "puede", "quiere", "sabe",
+                      "viene", "va", "da", "pone", "toma", "lleva"],
+    "numeros":       ["uno", "dos", "tres", "cuatro", "cinco",
+                      "seis", "siete", "ocho", "nueve", "diez", "cien", "mil"],
+    "colores":       ["rojo", "azul", "verde", "negro", "blanco",
+                      "amarillo", "gris", "morado", "naranja", "rosa"],
+    "lugares":       ["ciudad", "pais", "casa", "calle", "plaza",
+                      "europa", "america", "mexico", "españa", "mundo"],
+    "tiempo":        ["hoy", "ayer", "mañana", "año", "mes", "dia",
+                      "hora", "semana", "siglo", "momento", "ahora", "antes"],
+    "emociones":     ["amor", "miedo", "alegria", "tristeza", "enojo",
+                      "feliz", "triste", "solo", "contento", "furioso", "calma"],
+    "naturaleza":    ["agua", "fuego", "tierra", "aire", "sol", "luna",
+                      "mar", "rio", "montaña", "bosque", "cielo", "viento"],
+    "abstractos":    ["verdad", "vida", "muerte", "dios", "alma",
+                      "poder", "bien", "mal", "libertad", "justicia", "paz"],
 }
 
 
@@ -38,12 +54,15 @@ class TrainConfig:
     block_size: int = 128
     vocab_size: int = 65536
     n_embd: int = 768 # 192
-    n_head: int = 24 # 6
-    n_layer: int = 4
+    n_head: int = 12 #24 # 6
+    n_layer: int = 12
 
+    dropout: float = 0.1
+    weight_tying: bool = True
+    
     max_iters: int = 100000 # 25000
     eval_interval: int = 500 # 500
-    eval_batches: int = 20
+    eval_batches: int = 50 #20
     save_interval: int = 500 # 500
     grad_log_interval: int = 20
     umap_interval: int = 2000
@@ -60,7 +79,7 @@ class TrainConfig:
 
     train_bin: str = str(REPO_ROOT / "train.bin")
     val_bin: str = str(REPO_ROOT / "val.bin")
-    checkpoint_path: str = str(REPO_ROOT / "pequellm_pesado_checkpoint.pth")
+    checkpoint_path: str = str(REPO_ROOT / "pequellm_gpt2small_checkpoint.pth")
     tokenizer_path: str = str(REPO_ROOT / "tokenizer-culturax-es-hf.json")
     output_root: str = str(EMB_DIR / "artifacts_gpt2")
 
@@ -74,12 +93,13 @@ class TrainConfig:
 
 
 class Head(nn.Module):
-    def __init__(self, n_embd: int, block_size: int, head_size: int):
+    def __init__(self, n_embd: int, block_size: int, head_size: int, dropout: float = 0.1):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, channels = x.shape
@@ -88,40 +108,42 @@ class Head(nn.Module):
         att = q @ k.transpose(-2, -1) * (channels ** -0.5)
         att = att.masked_fill(self.tril[:seq_len, :seq_len] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)  # dropout sobre los pesos de atención
         return att @ self.value(x)
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_embd: int, block_size: int, n_head: int):
+    def __init__(self, n_embd: int, block_size: int, n_head: int, dropout: float = 0.1):
         super().__init__()
         head_size = n_embd // n_head
         self.heads = nn.ModuleList(
-            [Head(n_embd=n_embd, block_size=block_size, head_size=head_size) for _ in range(n_head)]
+            [Head(n_embd=n_embd, block_size=block_size, head_size=head_size, dropout=dropout) for _ in range(n_head)]
         )
         self.proj = nn.Linear(n_embd, n_embd)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(torch.cat([head(x) for head in self.heads], dim=-1))
-
+        out = self.proj(torch.cat([head(x) for head in self.heads], dim=-1))
+        return self.resid_dropout(out)
 
 class FeedForward(nn.Module):
-    def __init__(self, n_embd: int):
+    def __init__(self, n_embd: int, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
 class Block(nn.Module):
-    def __init__(self, n_embd: int, block_size: int, n_head: int):
+    def __init__(self, n_embd: int, block_size: int, n_head: int, dropout: float = 0.1):
         super().__init__()
-        self.sa = MultiHeadAttention(n_embd=n_embd, block_size=block_size, n_head=n_head)
-        self.ffwd = FeedForward(n_embd=n_embd)
+        self.sa = MultiHeadAttention(n_embd=n_embd, block_size=block_size, n_head=n_head, dropout=dropout)
+        self.ffwd = FeedForward(n_embd=n_embd, dropout=dropout)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
@@ -136,16 +158,24 @@ class GPTModel(nn.Module):
         self.cfg = cfg
         self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.position_embedding_table = nn.Embedding(cfg.block_size, cfg.n_embd)
-        self.blocks = nn.Sequential(*[Block(cfg.n_embd, cfg.block_size, cfg.n_head) for _ in range(cfg.n_layer)])
+        self.emb_dropout = nn.Dropout(cfg.dropout)
+        self.blocks = nn.Sequential(*[
+            Block(cfg.n_embd, cfg.block_size, cfg.n_head, cfg.dropout)
+            for _ in range(cfg.n_layer)
+        ])
         self.ln_f = nn.LayerNorm(cfg.n_embd)
-        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size)
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+
+        if cfg.weight_tying:
+            self.lm_head.weight = self.token_embedding_table.weight
+            print("[INFO] Weight tying activado: lm_head comparte pesos con token_embedding")
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
         bsz, seq_len = idx.shape
         pos = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(pos)
-        x = tok_emb + pos_emb
+        x = self.emb_dropout(tok_emb + pos_emb)  # dropout en embeddings
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -159,7 +189,7 @@ class GPTModel(nn.Module):
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.block_size :]
+            idx_cond = idx[:, -self.cfg.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
@@ -180,8 +210,8 @@ class BinTokenDataset:
         if max_start <= 0:
             raise ValueError(f"Dataset {self.path} is too short for block_size={block_size}")
         ix = torch.randint(max_start, (batch_size,))
-        x = torch.stack([torch.from_numpy((self.data[i : i + block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((self.data[i + 1 : i + block_size + 1]).astype(np.int64)) for i in ix])
+        x = torch.stack([torch.from_numpy((self.data[i: i + block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((self.data[i + 1: i + block_size + 1]).astype(np.int64)) for i in ix])
         return x, y
 
 
@@ -208,7 +238,6 @@ def resolve_amp_settings(cfg: TrainConfig, device: str) -> AmpSettings:
     if requested not in {"auto", "fp32", "fp16", "bf16"}:
         requested = "auto"
 
-    # AMP is mainly useful on CUDA; keep CPU/MPS in fp32 for stability.
     if device != "cuda":
         return AmpSettings(enabled=False, device_type=device, dtype=torch.float32, use_grad_scaler=False)
 
@@ -218,7 +247,6 @@ def resolve_amp_settings(cfg: TrainConfig, device: str) -> AmpSettings:
     if requested == "bf16":
         if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
             return AmpSettings(enabled=True, device_type="cuda", dtype=torch.bfloat16, use_grad_scaler=False)
-        # fall back to fp16 if bf16 unsupported
         return AmpSettings(enabled=True, device_type="cuda", dtype=torch.float16, use_grad_scaler=True)
 
     if requested == "fp16":
@@ -254,9 +282,15 @@ def get_lr(step: int, cfg: TrainConfig, start_iter: int = 0) -> float:
 def configure_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
     decay_params = []
     no_decay_params = []
+    seen_ids = set()
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        if id(param) in seen_ids:
+            continue
+        seen_ids.add(id(param))
+
         if param.ndim >= 2 and "embedding" not in name and "ln" not in name and not name.endswith("bias"):
             decay_params.append(param)
         else:
@@ -382,7 +416,7 @@ def count_loss_spikes(history: List[Dict[str, float]], threshold: float = 0.05) 
 def reduce_to_2d(vectors: np.ndarray, random_state: int) -> Tuple[np.ndarray, str]:
     try:
         import umap
-
+        
         reducer = umap.UMAP(
             n_components=2,
             n_neighbors=30,
@@ -516,7 +550,12 @@ def save_umap_snapshot(
 
 def compute_probe_metrics(model: GPTModel, tokenizer: Tokenizer | None) -> Dict[str, float]:
     if tokenizer is None:
-        return {"probe_intra_cos": float("nan"), "probe_inter_cos": float("nan"), "probe_gap": float("nan"), "probe_knn_purity": float("nan")}
+        return {
+            "probe_intra_cos": float("nan"),
+            "probe_inter_cos": float("nan"),
+            "probe_gap": float("nan"),
+            "probe_knn_purity": float("nan"),
+        }
 
     emb_table = model.token_embedding_table.weight.detach().cpu()
     vectors = []
@@ -531,7 +570,12 @@ def compute_probe_metrics(model: GPTModel, tokenizer: Tokenizer | None) -> Dict[
             labels.append(category)
 
     if len(vectors) < 4:
-        return {"probe_intra_cos": float("nan"), "probe_inter_cos": float("nan"), "probe_gap": float("nan"), "probe_knn_purity": float("nan")}
+        return {
+            "probe_intra_cos": float("nan"),
+            "probe_inter_cos": float("nan"),
+            "probe_gap": float("nan"),
+            "probe_knn_purity": float("nan"),
+        }
 
     mat = np.vstack(vectors)
     norm = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
@@ -621,7 +665,7 @@ def validate_embedding_size(cfg: TrainConfig) -> Dict[str, str]:
     checks["head_dim_range"] = "ok" if 16 <= head_dim <= 128 else "warn"
 
     emb_params = cfg.vocab_size * cfg.n_embd
-    emb_mem_mb = emb_params * 4 / (1024**2)
+    emb_mem_mb = emb_params * 4 / (1024 ** 2)
     checks["token_embedding_params"] = str(emb_params)
     checks["token_embedding_memory_mb_fp32"] = f"{emb_mem_mb:.2f}"
     checks["token_embedding_memory_mb_fp16"] = f"{emb_mem_mb / 2.0:.2f}"
@@ -710,6 +754,7 @@ class MetricsLogger:
         umap_method: str,
         extra: Dict[str, float] | None = None,
     ) -> None:
+        # Siempre append — el header ya fue escrito en __init__
         ex = extra or {}
         with self.train_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -738,7 +783,10 @@ class MetricsLogger:
                 writer.writerow([iteration, layer_name, grad_norm, delta])
 
 
-def save_checkpoint(path: Path, model: GPTModel, optimizer: torch.optim.Optimizer, iteration: int, run_dir: Path, cfg: TrainConfig) -> None:
+def save_checkpoint(
+    path: Path, model: GPTModel, optimizer: torch.optim.Optimizer,
+    iteration: int, run_dir: Path, cfg: TrainConfig
+) -> None:
     payload = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -750,7 +798,8 @@ def save_checkpoint(path: Path, model: GPTModel, optimizer: torch.optim.Optimize
 
 
 def maybe_load_checkpoint(
-    path: Path, model: GPTModel, optimizer: torch.optim.Optimizer, resume: bool, device: str
+    path: Path, model: GPTModel, optimizer: torch.optim.Optimizer,
+    resume: bool, device: str
 ) -> Tuple[int, Path | None]:
     if not resume or not path.exists():
         return 0, None
@@ -764,9 +813,10 @@ def maybe_load_checkpoint(
         run_dir = Path(raw["run_dir"]) if "run_dir" in raw else None
         return start_iter, run_dir
 
-    # Backward compatibility: old checkpoint only with state_dict
+    # Backward compatibility: checkpoint antiguo solo con state_dict
     model.load_state_dict(raw)
     return 0, None
+
 
 def load_history_from_csv(train_path: Path) -> List[Dict[str, float]]:
     """Reconstruye el historial de métricas desde el CSV al resumir.
@@ -790,6 +840,7 @@ def load_history_from_csv(train_path: Path) -> List[Dict[str, float]]:
     if history:
         print(f"[INFO] Historial recargado desde CSV: {len(history)} entradas (iter {int(history[0]['iter'])}→{int(history[-1]['iter'])})")
     return history
+
 
 def build_run_dir(output_root: Path, run_name: str) -> Path:
     if run_name:
@@ -823,9 +874,6 @@ def train(cfg: TrainConfig) -> None:
     start_iter, restored_run = maybe_load_checkpoint(checkpoint_path, model, optimizer, cfg.resume, device)
     run_dir = restored_run if restored_run is not None else build_run_dir(Path(cfg.output_root), cfg.run_name)
 
-    # Ajustar max_iters al resumir para que el schedule LR sea correcto.
-    # Si start_iter=99999 y max_iters=100000, el nuevo techo es 199999.
-    # Esto evita que get_lr retorne siempre lr_min durante la segunda corrida.
     if start_iter > 0:
         cfg.max_iters = start_iter + cfg.max_iters
         print(f"[INFO] Resume detectado: max_iters ajustado a {cfg.max_iters} (start={start_iter})")
@@ -886,6 +934,7 @@ def train(cfg: TrainConfig) -> None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             global_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+
             if iteration % cfg.grad_log_interval == 0:
                 grad_norms = collect_layer_grad_norms(model)
                 logger.log_gradients(iteration, grad_norms, prev_grad_norms)
@@ -896,6 +945,7 @@ def train(cfg: TrainConfig) -> None:
         else:
             loss.backward()
             global_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+
             if iteration % cfg.grad_log_interval == 0:
                 grad_norms = collect_layer_grad_norms(model)
                 logger.log_gradients(iteration, grad_norms, prev_grad_norms)
@@ -1021,11 +1071,10 @@ def train(cfg: TrainConfig) -> None:
         gen_path.write_text(text, encoding="utf-8")
         print(f"[INFO] sample generation saved -> {gen_path}")
         print(f"[INFO] sample: {text[:200]}")
-        
+
     if cfg.auto_presentation:
         try:
             from presentation_report import generate_presentation
-
             outputs = generate_presentation(run_dir=run_dir, run_name=run_dir.name)
             print(f"[INFO] presentation generated -> {outputs.get('pdf')}")
             print(f"[INFO] presentation summary -> {outputs.get('markdown')}")
@@ -1061,6 +1110,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--val-bin", type=str, default=cfg.val_bin)
     parser.add_argument("--tokenizer-path", type=str, default=cfg.tokenizer_path)
     parser.add_argument("--output-root", type=str, default=cfg.output_root)
+    parser.add_argument("--dropout", type=float, default=cfg.dropout)
+    parser.add_argument("--no-weight-tying", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--skip-presentation", action="store_true")
     args = parser.parse_args()
@@ -1090,6 +1141,8 @@ def parse_args() -> TrainConfig:
     cfg.val_bin = args.val_bin
     cfg.tokenizer_path = args.tokenizer_path
     cfg.output_root = args.output_root
+    cfg.dropout = args.dropout
+    cfg.weight_tying = not args.no_weight_tying
     cfg.resume = not args.no_resume
     cfg.auto_presentation = not args.skip_presentation
     return cfg
