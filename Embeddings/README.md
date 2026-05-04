@@ -24,6 +24,7 @@ Todos los scripts usan PyTorch y leen datos desde `train.bin` con `np.memmap`.
 8. `comparacion_2.py`
 9. `GPT2_DIAGNOSTICS.md`
 10. `presentation_report.py`
+11. `generate_prompt.py`
 
 ## Explicacion de cada archivo
 
@@ -153,6 +154,41 @@ Todos los scripts usan PyTorch y leen datos desde `train.bin` con `np.memmap`.
 - Para que sirve:
   - Tener material listo para exponer sin armar diapositivas manualmente despues de entrenar.
 
+### `generate_prompt.py`
+
+- Que hace:
+  - Carga un checkpoint de `emb_gpt2.py`.
+  - Carga el tokenizador usado por el modelo.
+  - Recibe una frase inicial (`--prompt`).
+  - Genera varias continuaciones autoregresivas del texto.
+- Para que sirve:
+  - Probar rapidamente si el modelo ya puede continuar frases de forma cualitativa.
+  - Comparar como cambia la generacion al variar `temperature`, `top_k` o el checkpoint.
+- Ejemplo:
+
+```powershell
+python Embeddings/generate_prompt.py `
+  --prompt "Hola, soy un modelo de inteligencia artificial" `
+  --num-samples 3 `
+  --max-new-tokens 60
+```
+
+- Ejemplo guardando resultados:
+
+```powershell
+python Embeddings/generate_prompt.py `
+  --prompt "Hola, soy un modelo de inteligencia artificial" `
+  --num-samples 3 `
+  --output-file Embeddings/generations_hola.json
+```
+
+- Parametros utiles:
+  - `--checkpoint-path`: checkpoint a cargar.
+  - `--tokenizer-path`: tokenizador compatible con el checkpoint.
+  - `--temperature`: creatividad/ruido de muestreo; `0` usa argmax.
+  - `--top-k`: limita el muestreo a los K tokens mas probables.
+  - `--max-new-tokens`: cuantos tokens nuevos generar.
+
 ## Ejecucion rapida
 
 Desde `C:\Repos\PequeLLM`:
@@ -164,6 +200,7 @@ python Embeddings/emb_multi-attention.py
 python Embeddings/emb_bucle.py
 python Embeddings/emb_bb.py
 python Embeddings/emb_gpt2.py
+python Embeddings/generate_prompt.py --prompt "Hola, soy un modelo de inteligencia artificial"
 python Embeddings/comparacion_1.py
 python Embeddings/comparacion_2.py
 ```
