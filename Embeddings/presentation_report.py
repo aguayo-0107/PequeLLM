@@ -51,6 +51,26 @@ def _safe_col(rows: List[Dict[str, str]], key: str) -> np.ndarray:
     return np.array([_to_float(r.get(key, "nan")) for r in rows], dtype=np.float64)
 
 
+def _warmup_mask(metrics: Dict[str, np.ndarray], loss_threshold: float = 10.0) -> np.ndarray:
+    """Genera un mask booleano que excluye los iters de arranque donde el loss es
+    anormalmente alto (e.g. iter=0 con loss=455). Esto evita que la escala Y se
+    comprima y haga invisible el resto de la curva.
+
+    Se aplica a todas las métricas que se ven afectadas por el spike inicial:
+    - train_loss, val_loss, perplexity, bits_per_char (derivados del loss)
+    - global_grad_norm, param_norm (spikes al inicio)
+
+    No se aplica a: probe_gap, kNN purity, lr, emb_norm (arrancan normal).
+
+    threshold=10.0 es conservador — cualquier loss > 10 es arranque desde cero.
+    Un modelo entrenado en español debería tener loss < 7 rápidamente.
+    """
+    val = metrics.get("val_loss", np.array([]))
+    if val.size == 0:
+        return np.ones(0, dtype=bool)
+    return val < loss_threshold
+
+
 # ---------------------------------------------------------------------------
 # Data loaders
 # ---------------------------------------------------------------------------
@@ -210,16 +230,31 @@ def _page_losses(pdf: PdfPages, metrics: Dict[str, np.ndarray]) -> None:
     has_ppl = metrics["perplexity"].size > 0 and not np.all(np.isnan(metrics["perplexity"]))
     has_bpc = metrics["bits_per_char"].size > 0 and not np.all(np.isnan(metrics["bits_per_char"]))
 
+    # Aplicar mask para excluir iters de arranque con loss anormalmente alto
+    mask = _warmup_mask(metrics)
+    x            = metrics["iter"][mask]
+    train_loss   = metrics["train_loss"][mask]
+    val_loss     = metrics["val_loss"][mask]
+    lr           = metrics["lr"][mask]
+    perplexity   = metrics["perplexity"][mask] if has_ppl else np.array([])
+    bits_per_char = metrics["bits_per_char"][mask] if has_bpc else np.array([])
+
+    # Si después del mask no queda nada, usar los datos completos
+    if x.size == 0:
+        x, train_loss, val_loss, lr = (metrics["iter"], metrics["train_loss"],
+                                        metrics["val_loss"], metrics["lr"])
+        perplexity    = metrics["perplexity"] if has_ppl else np.array([])
+        bits_per_char = metrics["bits_per_char"] if has_bpc else np.array([])
+
     ncols = 2 + int(has_ppl) + int(has_bpc)
     fig, axs = plt.subplots(1, ncols, figsize=(16, 9))
     if ncols == 1:
         axs = [axs]
-    x = metrics["iter"]
     col = 0
 
     # Train vs Val loss
-    axs[col].plot(x, metrics["train_loss"], label="train_loss", color="#1f77b4", linewidth=2)
-    axs[col].plot(x, metrics["val_loss"], label="val_loss", color="#d62728", linewidth=2)
+    axs[col].plot(x, train_loss, label="train_loss", color="#1f77b4", linewidth=2)
+    axs[col].plot(x, val_loss, label="val_loss", color="#d62728", linewidth=2)
     axs[col].set_title("Train vs Validation Loss")
     axs[col].set_xlabel("Iteration")
     axs[col].set_ylabel("Loss")
@@ -227,8 +262,8 @@ def _page_losses(pdf: PdfPages, metrics: Dict[str, np.ndarray]) -> None:
     axs[col].grid(alpha=0.25)
     col += 1
 
-    # Learning rate
-    axs[col].plot(x, metrics["lr"], label="learning_rate", color="#2ca02c", linewidth=2)
+    # Learning rate — no necesita mask, el warmup es parte del experimento
+    axs[col].plot(metrics["iter"], metrics["lr"], label="learning_rate", color="#2ca02c", linewidth=2)
     axs[col].set_title("Learning Rate Schedule")
     axs[col].set_xlabel("Iteration")
     axs[col].set_ylabel("LR")
@@ -236,8 +271,8 @@ def _page_losses(pdf: PdfPages, metrics: Dict[str, np.ndarray]) -> None:
     col += 1
 
     # Perplexity
-    if has_ppl:
-        axs[col].plot(x, metrics["perplexity"], label="perplexity", color="#8c564b", linewidth=2)
+    if has_ppl and perplexity.size > 0:
+        axs[col].plot(x, perplexity, label="perplexity", color="#8c564b", linewidth=2)
         axs[col].set_title("Perplexity (e^val_loss)")
         axs[col].set_xlabel("Iteration")
         axs[col].set_ylabel("Perplexity")
@@ -245,8 +280,8 @@ def _page_losses(pdf: PdfPages, metrics: Dict[str, np.ndarray]) -> None:
         col += 1
 
     # Bits per character
-    if has_bpc:
-        axs[col].plot(x, metrics["bits_per_char"], label="bits_per_char", color="#e377c2", linewidth=2)
+    if has_bpc and bits_per_char.size > 0:
+        axs[col].plot(x, bits_per_char, label="bits_per_char", color="#e377c2", linewidth=2)
         axs[col].set_title("Bits per Character")
         axs[col].set_xlabel("Iteration")
         axs[col].set_ylabel("BPC")
@@ -265,17 +300,22 @@ def _page_gradients(
     layer_names: List[str],
     iter_ticks: List[int],
 ) -> None:
+    # Mask para global_grad_norm — tiene spike enorme al inicio
+    mask = _warmup_mask(metrics)
+    x        = metrics["iter"][mask] if mask.size > 0 else metrics["iter"]
+    grad_norm = metrics["global_grad_norm"][mask] if mask.size > 0 else metrics["global_grad_norm"]
+    probe_gap = metrics["probe_gap"][mask] if mask.size > 0 else metrics["probe_gap"]
+    grad_ratio = metrics["grad_norm_ratio"][mask] if mask.size > 0 else metrics["grad_norm_ratio"]
+
     fig, axs = plt.subplots(2, 1, figsize=(16, 9), height_ratios=[1.0, 1.4])
-    x = metrics["iter"]
 
-    axs[0].plot(x, metrics["global_grad_norm"], color="#9467bd", linewidth=2, label="global_grad_norm")
-    axs[0].plot(x, metrics["probe_gap"], color="#ff7f0e", linewidth=2, label="probe_gap")
+    axs[0].plot(x, grad_norm, color="#9467bd", linewidth=2, label="global_grad_norm")
+    axs[0].plot(x, probe_gap, color="#ff7f0e", linewidth=2, label="probe_gap")
 
-    # grad_norm_ratio si está disponible
-    has_ratio = metrics["grad_norm_ratio"].size > 0 and not np.all(np.isnan(metrics["grad_norm_ratio"]))
+    has_ratio = grad_ratio.size > 0 and not np.all(np.isnan(grad_ratio))
     if has_ratio:
         ax2 = axs[0].twinx()
-        ax2.plot(x, metrics["grad_norm_ratio"], color="#17becf", linewidth=1.5,
+        ax2.plot(x, grad_ratio, color="#17becf", linewidth=1.5,
                  linestyle="--", alpha=0.7, label="grad_norm_ratio")
         ax2.set_ylabel("grad_norm_ratio", color="#17becf", fontsize=9)
         ax2.axhline(y=3.0, color="#17becf", linestyle=":", alpha=0.5, label="spike threshold (3x)")
@@ -311,20 +351,28 @@ def _page_model_health(pdf: PdfPages, metrics: Dict[str, np.ndarray]) -> None:
     has_tps    = not np.all(np.isnan(metrics["tokens_per_sec"]))
 
     if not (has_param or has_emb or has_tps):
-        return  # Corrida antigua sin nuevas métricas, no generar página vacía
+        return
 
-    x = metrics["iter"]
+    # Mask para param_norm y tokens_per_sec que tienen spikes al inicio
+    mask = _warmup_mask(metrics)
+    x_masked = metrics["iter"][mask] if mask.size > 0 else metrics["iter"]
+    x_full   = metrics["iter"]
+
     plots = []
     if has_param:
-        plots.append(("param_norm", metrics["param_norm"], "#e74c3c",
+        data = metrics["param_norm"][mask] if mask.size > 0 else metrics["param_norm"]
+        plots.append(("param_norm", x_masked, data, "#e74c3c",
                       "Param Norm (L2 total de pesos)",
                       "Si crece sin control → pesos explotando"))
     if has_emb:
-        plots.append(("emb_norm_mean", metrics["emb_norm_mean"], "#3498db",
+        # emb_norm arranca normal, no necesita mask
+        plots.append(("emb_norm_mean", x_full, metrics["emb_norm_mean"], "#3498db",
                       "Embedding Norm Media",
                       "Debe crecer gradualmente conforme aprende"))
     if has_tps:
-        plots.append(("tokens_per_sec", metrics["tokens_per_sec"], "#27ae60",
+        # tokens_per_sec: spikes de UMAP distorsionan, aplicar mask
+        data = metrics["tokens_per_sec"][mask] if mask.size > 0 else metrics["tokens_per_sec"]
+        plots.append(("tokens_per_sec", x_masked, data, "#27ae60",
                       "Tokens por Segundo",
                       "Eficiencia de GPU — caídas = throttling"))
 
@@ -332,8 +380,8 @@ def _page_model_health(pdf: PdfPages, metrics: Dict[str, np.ndarray]) -> None:
     if len(plots) == 1:
         axs = [axs]
 
-    for ax, (key, data, color, title, subtitle) in zip(axs, plots):
-        ax.plot(x, data, color=color, linewidth=2)
+    for ax, (key, xdata, data, color, title, subtitle) in zip(axs, plots):
+        ax.plot(xdata, data, color=color, linewidth=2)
         ax.set_title(title, fontsize=12, fontweight="bold")
         ax.set_xlabel("Iteration")
         ax.set_ylabel(key)
@@ -341,15 +389,15 @@ def _page_model_health(pdf: PdfPages, metrics: Dict[str, np.ndarray]) -> None:
                 ha="center", fontsize=9, alpha=0.7)
         ax.grid(alpha=0.25)
 
-    # Si hay emb_norm_std, añadir banda de confianza al gráfico de embedding
+    # Banda ±1std para embedding norm
     if has_emb:
         emb_ax = axs[[k for k, (key, *_) in enumerate(plots) if key == "emb_norm_mean"][0]]
-        std = metrics["emb_norm_std"]
+        std  = metrics["emb_norm_std"]
         mean = metrics["emb_norm_mean"]
         valid = ~(np.isnan(mean) | np.isnan(std))
         if valid.any():
             emb_ax.fill_between(
-                x[valid], (mean - std)[valid], (mean + std)[valid],
+                x_full[valid], (mean - std)[valid], (mean + std)[valid],
                 alpha=0.25, color="#3498db", label="±1 std"
             )
             emb_ax.legend()
