@@ -115,6 +115,7 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -122,8 +123,7 @@ class Head(nn.Module):
         k = self.key(x)
         q = self.query(x)
         att = q @ k.transpose(-2, -1) * (channels ** -0.5)
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-        att = att.masked_fill(~causal_mask, float("-inf"))
+        att = att.masked_fill(self.tril[:seq_len, :seq_len] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         return att @ self.value(x)
