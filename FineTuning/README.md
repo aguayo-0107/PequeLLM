@@ -55,7 +55,25 @@ text,label
 "gana dinero rapido aqui","spam"
 ```
 
-Por default busca:
+El dataset real preparado para seguir el libro es el SMS Spam Collection de UCI:
+
+```text
+FineTuning/data/sms_spam_train.csv
+FineTuning/data/sms_spam_val.csv
+FineTuning/data/sms_spam_test.csv
+```
+
+Resumen:
+
+- Fuente: `https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip`
+- Total: 5,574 mensajes.
+- Train: 4,458 ejemplos.
+- Validation: 556 ejemplos.
+- Test: 560 ejemplos.
+- Etiquetas: `ham` y `spam`.
+- Split: estratificado 80/10/10 con seed 42.
+
+Tambien quedan CSV demo pequenos para smoke tests:
 
 ```text
 FineTuning/data/classification_demo_train.csv
@@ -118,10 +136,10 @@ Cuando tu companera termine o tenga un checkpoint estable del pretraining:
 ```powershell
 python FineTuning/finetune_classifier.py `
   --base-checkpoint-path pequellm_pesado_checkpoint.pth `
-  --train-csv FineTuning/data/mi_train.csv `
-  --val-csv FineTuning/data/mi_val.csv `
-  --test-csv FineTuning/data/mi_test.csv `
-  --run-name spam_v1 `
+  --train-csv FineTuning/data/sms_spam_train.csv `
+  --val-csv FineTuning/data/sms_spam_val.csv `
+  --test-csv FineTuning/data/sms_spam_test.csv `
+  --run-name sms_spam_gpt2_v1 `
   --precision auto
 ```
 
@@ -143,10 +161,10 @@ Un ejemplo de ruta podria ser:
 ```bash
 python FineTuning/finetune_classifier.py \
   --base-checkpoint-path /workspace/data/pequellm_pesado_checkpoint.pth \
-  --train-csv FineTuning/data/mi_train.csv \
-  --val-csv FineTuning/data/mi_val.csv \
-  --test-csv FineTuning/data/mi_test.csv \
-  --run-name spam_v1 \
+  --train-csv FineTuning/data/sms_spam_train.csv \
+  --val-csv FineTuning/data/sms_spam_val.csv \
+  --test-csv FineTuning/data/sms_spam_test.csv \
+  --run-name sms_spam_gpt2_v1 \
   --precision auto
 ```
 
@@ -357,5 +375,236 @@ Despues de clasificacion, el siguiente paso del libro es instruction fine-tuning
 instruction + input -> response
 ```
 
-Eso corresponde al capitulo 7 y debe implementarse aparte, cuando tengamos un modelo base
-o un checkpoint suficientemente bueno.
+Eso corresponde al capitulo 7 y esta implementado en esta misma carpeta.
+
+# Capitulo 7: instruction fine-tuning
+
+## Dataset usado
+
+Seguimos el dataset del libro:
+
+```text
+FineTuning/data/instruction-data.json
+```
+
+Fuente:
+
+```text
+https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch07/01_main-chapter-code/instruction-data.json
+```
+
+El dataset contiene 1,100 ejemplos con esta estructura:
+
+```json
+{
+  "instruction": "Identify the correct spelling of the following word.",
+  "input": "Ocassion",
+  "output": "The correct spelling is 'Occasion.'"
+}
+```
+
+Los splits siguen el libro:
+
+```text
+train: 935 ejemplos  (85%)
+test:  110 ejemplos  (10%)
+val:    55 ejemplos  (5%)
+```
+
+Archivos preparados:
+
+```text
+FineTuning/data/instruction_train.json
+FineTuning/data/instruction_test.json
+FineTuning/data/instruction_val.json
+FineTuning/data/instruction_dataset_summary.json
+```
+
+Para regenerarlos:
+
+```powershell
+python FineTuning/prepare_instruction_data.py
+```
+
+## Formato Alpaca usado por el libro
+
+Cada ejemplo se convierte a texto con este formato:
+
+```text
+Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+<instruction>
+
+### Input:
+<input opcional>
+
+### Response:
+<output esperado>
+```
+
+Si `input` esta vacio, la seccion `### Input` se omite.
+
+## Entrenar instruction fine-tuning
+
+Con el checkpoint principal:
+
+```powershell
+.\pequellm\Scripts\python.exe FineTuning\finetune_instruction.py `
+  --base-checkpoint-path pequellm_pesado_checkpoint.pth `
+  --train-json FineTuning\data\instruction_train.json `
+  --val-json FineTuning\data\instruction_val.json `
+  --test-json FineTuning\data\instruction_test.json `
+  --run-name instruction_gpt2_v1 `
+  --precision auto
+```
+
+## Entrenar GPT-2 oficial preentrenado
+
+Si queremos fine-tunear **GPT-2 preentrenado oficial** en vez de nuestro PequeLLM,
+usamos `transformers` y el modelo `gpt2` de Hugging Face:
+
+```powershell
+.\pequellm\Scripts\python.exe FineTuning\finetune_instruction_hf_gpt2.py `
+  --model-name gpt2 `
+  --train-json FineTuning\data\instruction_train.json `
+  --val-json FineTuning\data\instruction_val.json `
+  --test-json FineTuning\data\instruction_test.json `
+  --run-name hf_gpt2_instruction_v1 `
+  --batch-size 1 `
+  --max-length 256 `
+  --max-epochs 1 `
+  --eval-interval 50 `
+  --eval-batches 5 `
+  --precision auto
+```
+
+Este flujo descarga/carga el GPT-2 preentrenado oficial con:
+
+```python
+AutoModelForCausalLM.from_pretrained("gpt2")
+AutoTokenizer.from_pretrained("gpt2")
+```
+
+La salida se guarda en:
+
+```text
+FineTuning/artifacts_instruction_hf/<run_name>/
+```
+
+El mejor modelo queda como carpeta Hugging Face:
+
+```text
+FineTuning/artifacts_instruction_hf/<run_name>/best_hf_gpt2_instruction/
+```
+
+Nota: si el modelo no esta cacheado, la primera corrida necesita internet para
+descargar pesos/tokenizador desde Hugging Face.
+
+Prueba mini segura con modelo pequeno aleatorio:
+
+```powershell
+.\pequellm\Scripts\python.exe FineTuning\finetune_instruction.py `
+  --base-checkpoint-path FineTuning\data\no_checkpoint_for_demo.pth `
+  --n-embd 32 `
+  --n-head 4 `
+  --n-layer 1 `
+  --block-size 64 `
+  --max-length 64 `
+  --batch-size 2 `
+  --max-epochs 1 `
+  --eval-interval 1 `
+  --eval-batches 1 `
+  --generate-samples 1 `
+  --run-name instruction_smoke
+```
+
+En `renna`, dentro del contenedor:
+
+```bash
+python FineTuning/finetune_instruction.py \
+  --base-checkpoint-path /workspace/data/pequellm_pesado_checkpoint.pth \
+  --train-json FineTuning/data/instruction_train.json \
+  --val-json FineTuning/data/instruction_val.json \
+  --test-json FineTuning/data/instruction_test.json \
+  --run-name instruction_gpt2_v1 \
+  --precision auto
+```
+
+## Archivos de salida
+
+Cada corrida crea:
+
+```text
+FineTuning/artifacts_instruction/<run_name>/
+```
+
+Con:
+
+```text
+config.json
+metrics.csv
+best_instruction_checkpoint.pth
+final_metrics.json
+sample_responses.json
+```
+
+`metrics.csv`
+
+Guarda `train_loss` y `val_loss`.
+
+`best_instruction_checkpoint.pth`
+
+Checkpoint con menor validation loss.
+
+`sample_responses.json`
+
+Respuestas generadas para algunos ejemplos del test set.
+
+## Usar el modelo instruction-tuned
+
+```powershell
+.\pequellm\Scripts\python.exe FineTuning\generate_instruction_response.py `
+  --checkpoint-path FineTuning\artifacts_instruction\instruction_gpt2_v1\best_instruction_checkpoint.pth `
+  --instruction "Rewrite the following sentence in active voice." `
+  --input "The cake was baked by Sarah."
+```
+
+Con muestreo:
+
+```powershell
+.\pequellm\Scripts\python.exe FineTuning\generate_instruction_response.py `
+  --checkpoint-path FineTuning\artifacts_instruction\instruction_gpt2_v1\best_instruction_checkpoint.pth `
+  --instruction "Suggest a formal synonym for happy." `
+  --temperature 0.8 `
+  --top-k 50
+```
+
+## Decisiones importantes
+
+`finetune_instruction.py`
+
+Entrena el mismo `GPTModel` autoregresivo del pretraining, no agrega una cabeza nueva.
+La diferencia con clasificacion es que aqui seguimos usando `lm_head`, porque el modelo
+debe generar texto, no escoger una etiqueta.
+
+`mask_prompt_tokens`
+
+Por default esta apagado para seguir el flujo base del libro: el loss se calcula sobre
+la secuencia completa y se ignora solo el padding. Si queremos entrenar solo la respuesta,
+podemos activar:
+
+```powershell
+--mask-prompt-tokens
+```
+
+`freeze_base`
+
+Por default esta apagado, porque el capitulo 7 fine-tunea el LLM. Si falta memoria o
+queremos una prueba barata:
+
+```powershell
+--freeze-base
+```
+
+Esto entrena el ultimo bloque, `ln_f` y `lm_head`.

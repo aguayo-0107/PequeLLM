@@ -1,0 +1,37 @@
+{
+  "source": "UCI SMS Spam Collection",
+  "source_url": "https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip",
+  "seed": 42,
+  "split_strategy": "stratified 80/10/10 by label",
+  "total_examples": 5574,
+  "total_labels": {
+    "ham": 4827,
+    "spam": 747
+  },
+  "splits": {
+    "train": {
+      "examples": 4458,
+      "labels": {
+        "ham": 3861,
+        "spam": 597
+      },
+      "path": "FineTuning\\data\\sms_spam_train.csv"
+    },
+    "val": {
+      "examples": 556,
+      "labels": {
+        "ham": 482,
+        "spam": 74
+      },
+      "path": "FineTuning\\data\\sms_spam_val.csv"
+    },
+    "test": {
+      "examples": 560,
+      "labels": {
+        "ham": 484,
+        "spam": 76
+      },
+      "path": "FineTuning\\data\\sms_spam_test.csv"
+    }
+  }
+}
