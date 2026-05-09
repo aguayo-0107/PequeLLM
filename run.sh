@@ -7,7 +7,7 @@
 #     ./run.sh smoke          # solo verificar que la GPU se ve
 #     ./run.sh synth          # generar train.bin/val.bin sinteticos
 #     ./run.sh prepare-data   # correr Tokenizador/prepare_data/prepare_data.py (CulturaX, lento)
-#     ./run.sh train [args]   # entrenar pasando args extras a emb_gpt2.py
+#     ./run.sh train [args]   # entrenar pasando args extras a Emb_gptMed.py
 #     ./run.sh shell          # bash interactivo dentro del contenedor
 #
 # Variables de entorno opcionales:
@@ -127,13 +127,13 @@ case "$cmd" in
             echo "[run.sh] Paso 1/2: smoke test de GPU..." >&2
             "$RUNTIME" run "${common_run_args[@]}" "$IMAGE" \
                 python /workspace/repo/scripts/check_gpu.py
-            echo "[run.sh] Paso 2/2: entrenamiento (Embeddings/emb_gpt2.py)" >&2
+            echo "[run.sh] Paso 2/2: entrenamiento GPT-2 Medium (Embeddings/Emb_gptMed.py)" >&2
         fi
         "$RUNTIME" run "${common_run_args[@]}" "$IMAGE" \
-            python /workspace/repo/Embeddings/emb_gpt2.py \
+            python /workspace/repo/Embeddings/Emb_gptMed.py \
                 --train-bin       /workspace/data/train.bin \
                 --val-bin         /workspace/data/val.bin \
-                --checkpoint-path /workspace/data/pequellm_pesado_checkpoint.pth \
+                --checkpoint-path /workspace/data/pequellm_medium_checkpoint.pth \
                 --output-root     /workspace/data/artifacts_gpt2 \
                 "$@"
         ;;
