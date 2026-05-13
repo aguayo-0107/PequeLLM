@@ -7,8 +7,18 @@ __pycache__/
 
 # Training/checkpoint artifacts
 Embeddings/artifacts_gpt2/
+FineTuning/artifacts_classifier/
+FineTuning/artifacts_instruction/
+FineTuning/artifacts_instruction_hf/
+FineTuning/data/sms_spam_collection.zip
+FineTuning/data/sms_spam_collection_raw/
 *.pth
 *_checkpoint.pth
+
+# Local analysis/presentation artifacts
+docs/BOOK_ROADMAP.md
+Embeddings/project_progress_vs_book.png
+Embeddings/slide_arquitectura_embeddings_modelo.png
 
 # Herramientas locales de desarrollo (no se versionan)
 .claude/

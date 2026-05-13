@@ -1,0 +1,25 @@
+{
+  "source": "Raschka LLMs-from-scratch chapter 7 instruction-data.json",
+  "source_url": "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch/main/ch07/01_main-chapter-code/instruction-data.json",
+  "split_strategy": "book chapter 7 order-preserving 85/10/5 split: train/test/val",
+  "total_examples": 1100,
+  "splits": {
+    "train": {
+      "examples": 935,
+      "path": "FineTuning/data/instruction_train.json"
+    },
+    "test": {
+      "examples": 110,
+      "path": "FineTuning/data/instruction_test.json"
+    },
+    "val": {
+      "examples": 55,
+      "path": "FineTuning/data/instruction_val.json"
+    }
+  },
+  "fields": [
+    "instruction",
+    "input",
+    "output"
+  ]
+}
