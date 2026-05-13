@@ -137,6 +137,13 @@ case "$cmd" in
                 --output-root     /workspace/data/artifacts_gpt2 \
                 "$@"
         ;;
+    pruebas)
+        ensure_image
+        ensure_volumes
+        # Ejecuta el script de pruebas interactivo
+        "$RUNTIME" run "${common_run_args[@]}" "$IMAGE" \
+            python /workspace/repo/Embeddings/pruebas.py
+        ;;
 
     shell)
         ensure_image
@@ -150,7 +157,7 @@ case "$cmd" in
 
     *)
         echo "ERROR: subcomando desconocido: '$cmd'" >&2
-        echo "       Usa: $0 [build|smoke|synth|prepare-data|train|shell|help]" >&2
+        echo "       Usa: $0 [build|smoke|synth|prepare-data|train|shell|help|pruebas]" >&2
         exit 2
         ;;
 esac

@@ -10,7 +10,7 @@ from tokenizers import Tokenizer
 
 def completar(
     prompt: str,
-    checkpoint_path: str = str(REPO_ROOT / "pequellm_gpt2small_checkpoint.pth"),
+    checkpoint_path: str = "/workspace/data/pequellm_medium_checkpoint.pth",
     tokenizer_path: str = str(REPO_ROOT / "tokenizer-culturax-es-hf.json"),
     max_new_tokens: int = 100,
     temperature: float = 1.0,
