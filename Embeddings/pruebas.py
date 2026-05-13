@@ -7,6 +7,7 @@ from emb_gpt2 import (
 import torch
 from torch.nn import functional as F
 from tokenizers import Tokenizer
+from dataclasses import fields
 
 def completar(
     prompt: str,
@@ -42,7 +43,12 @@ def completar(
     if not isinstance(raw, dict) or "config" not in raw:
         raise ValueError("El checkpoint no tiene el formato esperado (falta 'config').")
 
-    cfg = TrainConfig(**raw["config"])
+    # ── Filtrar configuración antigua ─────────────────────────────────────────
+    config_guardada = raw["config"]
+    claves_validas = {f.name for f in fields(TrainConfig)}
+    config_filtrada = {k: v for k, v in config_guardada.items() if k in claves_validas}
+    
+    cfg = TrainConfig(**config_filtrada)
     model = GPTModel(cfg).to(device)
     model.load_state_dict(raw["model"])
     model.eval()
@@ -90,3 +96,4 @@ if __name__ == "__main__":
     print("\n--- Generando... ---\n")
     resultado = completar(prompt, max_new_tokens=tokens, temperature=temp)
     print(resultado)
+    
