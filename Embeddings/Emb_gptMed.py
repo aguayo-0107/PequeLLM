@@ -4,10 +4,11 @@ import argparse
 import csv
 import json
 import math
+import signal
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,7 +18,7 @@ from tokenizers import Tokenizer
 
 try:
     import matplotlib.pyplot as plt
-except Exception:  # pragma: no cover - optional dependency in runtime
+except Exception:
     plt = None
 
 
@@ -48,19 +49,92 @@ PROBE_WORDS = {
 }
 
 
+# ── Shutdown global flag ──────────────────────────────────────────────────────
+# Se activa cuando llega SIGINT (Ctrl+C) o SIGTERM.
+# El loop de entrenamiento lo revisa en cada iteración y termina limpiamente.
+
+_shutdown_requested: bool = False
+
+
+def _handle_shutdown_signal(signum: int, frame) -> None:
+    global _shutdown_requested
+    sig_name = "SIGINT (Ctrl+C)" if signum == signal.SIGINT else "SIGTERM"
+    print(f"\n[SIGNAL] {sig_name} recibida — finalizando tras la iteración actual...")
+    print("[SIGNAL] Espera: se guardarán el checkpoint y el reporte completo.")
+    _shutdown_requested = True
+
+
+# ── Convergence tracker ───────────────────────────────────────────────────────
+
+@dataclass
+class ConvergenceTracker:
+    """
+    Early stopping basado en val_loss.
+
+    Se considera convergencia cuando el val_loss no mejora en más de
+    `min_delta` durante `patience` evaluaciones consecutivas.
+
+    patience=30 con eval_interval=500 → 15,000 iters sin mejora antes de parar.
+    Esto es conservador a propósito: queremos que el modelo explote todo
+    el potencial antes de detenerse.
+    """
+    patience: int = 30
+    min_delta: float = 0.001
+    best_val_loss: float = float("inf")
+    no_improve_count: int = 0
+    best_iter: int = 0
+
+    def update(self, val_loss: float, iteration: int) -> bool:
+        """Devuelve True si se debe detener el entrenamiento."""
+        if math.isnan(val_loss):
+            return False
+        if val_loss < self.best_val_loss - self.min_delta:
+            self.best_val_loss = val_loss
+            self.no_improve_count = 0
+            self.best_iter = iteration
+            return False
+        self.no_improve_count += 1
+        remaining = self.patience - self.no_improve_count
+        if remaining <= 5:
+            print(
+                f"[CONVERGENCIA] Sin mejora en {self.no_improve_count}/{self.patience} "
+                f"evaluaciones (mejor val_loss={self.best_val_loss:.4f} en iter={self.best_iter}). "
+                f"Quedan {remaining} oportunidades."
+            )
+        return self.no_improve_count >= self.patience
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
 @dataclass
 class TrainConfig:
-    batch_size: int = 16
-    block_size: int = 128
+    # ── Arquitectura — defaults para GPT-2 Medium ────────────────────────────
+    batch_size: int = 8
+    block_size: int = 256
     vocab_size: int = 65536
-    n_embd: int = 768
-    n_head: int = 12
-    n_layer: int = 12
+    n_embd: int = 1024
+    n_head: int = 16      # head_dim = 1024/16 = 64, igual que GPT-2 original
+    n_layer: int = 24
 
     dropout: float = 0.1
     weight_tying: bool = True
 
-    max_iters: int = 100000
+    # ── Iteraciones ──────────────────────────────────────────────────────────
+    # max_iters = -1 → correr hasta convergencia (recomendado).
+    # max_iters > 0  → límite duro de iteraciones (compatibilidad original).
+    max_iters: int = -1
+
+    # Horizonte del cosine LR schedule. Independiente de cuándo para el training.
+    # Con max_iters=-1 este valor define la forma de la curva de LR.
+    # 600000 da un decay suave y largo, apropiado para Medium.
+    lr_horizon: int = 600000
+
+    # ── Early stopping ───────────────────────────────────────────────────────
+    # patience: número de evaluaciones (eval_interval pasos c/u) sin mejora
+    # antes de declarar convergencia. 30 × 500 = 15,000 iters.
+    patience: int = 30
+    min_delta: float = 0.001   # mejora mínima para considerar progreso
+
     eval_interval: int = 500
     eval_batches: int = 50
     save_interval: int = 500
@@ -69,32 +143,32 @@ class TrainConfig:
     umap_sample_size: int = 2000
     umap_random_state: int = 42
 
-    lr_max: float = 3e-4
-    lr_min: float = 3e-5
-    warmup_iters: int = 500
+    # ── LR / Optimizer ───────────────────────────────────────────────────────
+    # lr_max reducido vs Small para mayor estabilidad en 24 capas.
+    lr_max: float = 2e-4
+    lr_min: float = 2e-5
+    warmup_iters: int = 1000   # más warmup para modelo más profundo
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
 
+    # ── Gradient stability ───────────────────────────────────────────────────
+    # Si el grad norm supera este umbral, se emite un warning (no detiene).
+    # Con 24 capas es normal ver picos, pero >5 sostenido es señal de problemas.
+    grad_norm_warn_threshold: float = 5.0
+
     # ── Warm restart ──────────────────────────────────────────────────────────
-    # Si True, carga los pesos del checkpoint pero descarta el estado de Adam.
-    # Usar junto con un lr_max reducido (~50% del original) para reiniciar el
-    # schedule sin desestabilizar lo aprendido.
     fresh_optimizer: bool = False
 
     # ── Pérdida contrastiva ───────────────────────────────────────────────────
-    # Empuja embeddings de la misma categoría semántica a estar más cerca y
-    # embeddings de categorías distintas a estar más lejos.
-    # contrastive_weight=0  →  desactivada (comportamiento original).
-    # Valor recomendado de inicio: 0.005. Si val_loss sube, bajar a 0.001.
     contrastive_weight: float = 0.005
-    contrastive_interval: int = 10       # cada cuántos pasos calcular la pérdida
+    contrastive_interval: int = 10
     contrastive_temperature: float = 0.07
 
     train_bin: str = str(REPO_ROOT / "train.bin")
     val_bin: str = str(REPO_ROOT / "val.bin")
-    checkpoint_path: str = str(REPO_ROOT / "pequellm_gpt2small_checkpoint.pth")
+    checkpoint_path: str = str(REPO_ROOT / "pequellm_gpt2medium_checkpoint.pth")
     tokenizer_path: str = str(REPO_ROOT / "tokenizer-culturax-es-hf.json")
     output_root: str = str(EMB_DIR / "artifacts_gpt2")
 
@@ -112,9 +186,10 @@ class TrainConfig:
 class Head(nn.Module):
     def __init__(self, n_embd: int, block_size: int, head_size: int, dropout: float = 0.1):
         super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.key   = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -122,8 +197,7 @@ class Head(nn.Module):
         k = self.key(x)
         q = self.query(x)
         att = q @ k.transpose(-2, -1) * (channels ** -0.5)
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
-        att = att.masked_fill(~causal_mask, float("-inf"))
+        att = att.masked_fill(self.tril[:seq_len, :seq_len] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         return att @ self.value(x)
@@ -162,10 +236,10 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     def __init__(self, n_embd: int, block_size: int, n_head: int, dropout: float = 0.1):
         super().__init__()
-        self.sa = MultiHeadAttention(n_embd=n_embd, block_size=block_size, n_head=n_head, dropout=dropout)
+        self.sa   = MultiHeadAttention(n_embd=n_embd, block_size=block_size, n_head=n_head, dropout=dropout)
         self.ffwd = FeedForward(n_embd=n_embd, dropout=dropout)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
+        self.ln1  = nn.LayerNorm(n_embd)
+        self.ln2  = nn.LayerNorm(n_embd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.sa(self.ln1(x))
@@ -176,23 +250,49 @@ class GPTModel(nn.Module):
     def __init__(self, cfg: TrainConfig):
         super().__init__()
         self.cfg = cfg
-        self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+        self.token_embedding_table    = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.position_embedding_table = nn.Embedding(cfg.block_size, cfg.n_embd)
         self.emb_dropout = nn.Dropout(cfg.dropout)
         self.blocks = nn.Sequential(*[
             Block(cfg.n_embd, cfg.block_size, cfg.n_head, cfg.dropout)
             for _ in range(cfg.n_layer)
         ])
-        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.ln_f   = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
         if cfg.weight_tying:
             self.lm_head.weight = self.token_embedding_table.weight
             print("[INFO] Weight tying activado: lm_head comparte pesos con token_embedding")
 
+        # Inicialización escalada por profundidad (GPT-2 style).
+        # Reduce la varianza de los residuales en capas profundas,
+        # estabilizando el gradiente en modelos de 24+ capas.
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """
+        Inicializa pesos siguiendo el paper de GPT-2:
+        - Proyecciones residuales se escalan por 1/sqrt(2 * n_layer)
+          para que la varianza de la suma residual no explote con la profundidad.
+        - Embeddings y LayerNorm usan init estándar de PyTorch.
+        """
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+        # Escalar proyecciones residuales (sa.proj y ffwd.net[-2])
+        scale = 1.0 / math.sqrt(2 * self.cfg.n_layer)
+        for name, param in self.named_parameters():
+            if name.endswith("proj.weight") or name.endswith("net.2.weight"):
+                param.data.mul_(scale)
+
     def forward(
-        self, idx: torch.Tensor, targets: torch.Tensor | None = None
-    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, seq_len = idx.shape
         pos = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
         tok_emb = self.token_embedding_table(idx)
@@ -214,7 +314,7 @@ class GPTModel(nn.Module):
             idx_cond = idx[:, -self.cfg.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
+            probs  = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
@@ -226,16 +326,16 @@ class BinTokenDataset:
     def __init__(self, path: str):
         self.path = Path(path)
         if not self.path.exists():
-            raise FileNotFoundError(f"Dataset bin not found: {self.path}")
+            raise FileNotFoundError(f"Dataset bin no encontrado: {self.path}")
         self.data = np.memmap(self.path, dtype=np.uint16, mode="r")
 
     def get_batch(self, block_size: int, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         max_start = len(self.data) - block_size - 1
         if max_start <= 0:
-            raise ValueError(f"Dataset {self.path} is too short for block_size={block_size}")
+            raise ValueError(f"Dataset {self.path} demasiado corto para block_size={block_size}")
         ix = torch.randint(max_start, (batch_size,))
-        x = torch.stack([torch.from_numpy((self.data[i: i + block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((self.data[i + 1: i + block_size + 1]).astype(np.int64)) for i in ix])
+        x = torch.stack([torch.from_numpy(self.data[i: i + block_size].astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy(self.data[i + 1: i + block_size + 1].astype(np.int64)) for i in ix])
         return x, y
 
 
@@ -266,18 +366,14 @@ def resolve_amp_settings(cfg: TrainConfig, device: str) -> AmpSettings:
 
     if device != "cuda":
         return AmpSettings(enabled=False, device_type=device, dtype=torch.float32, use_grad_scaler=False)
-
     if requested == "fp32":
         return AmpSettings(enabled=False, device_type="cuda", dtype=torch.float32, use_grad_scaler=False)
-
     if requested == "bf16":
         if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
             return AmpSettings(enabled=True, device_type="cuda", dtype=torch.bfloat16, use_grad_scaler=False)
         return AmpSettings(enabled=True, device_type="cuda", dtype=torch.float16, use_grad_scaler=True)
-
     if requested == "fp16":
         return AmpSettings(enabled=True, device_type="cuda", dtype=torch.float16, use_grad_scaler=True)
-
     # auto
     if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
         return AmpSettings(enabled=True, device_type="cuda", dtype=torch.bfloat16, use_grad_scaler=False)
@@ -287,21 +383,27 @@ def resolve_amp_settings(cfg: TrainConfig, device: str) -> AmpSettings:
 # ── LR schedule ───────────────────────────────────────────────────────────────
 
 def get_lr(step: int, cfg: TrainConfig, start_iter: int = 0) -> float:
-    total_iters = cfg.max_iters
-    if total_iters <= 0:
+    """
+    Cosine decay con warmup.
+
+    Usa cfg.lr_horizon (no cfg.max_iters) como horizonte del schedule.
+    Esto permite correr hasta convergencia sin que el LR colapse a lr_min
+    prematuramente si max_iters=-1.
+    """
+    horizon = cfg.lr_horizon
+    if horizon <= 0:
         return cfg.lr_min
 
-    relative_step = step - start_iter
     warmup_end = start_iter + cfg.warmup_iters
 
     if step < warmup_end:
-        progress = float(relative_step + 1) / float(max(1, cfg.warmup_iters))
+        progress = float(step - start_iter + 1) / float(max(1, cfg.warmup_iters))
         return cfg.lr_max * progress
 
-    if step >= total_iters:
+    if step >= start_iter + horizon:
         return cfg.lr_min
 
-    decay_ratio = (step - warmup_end) / float(max(1, total_iters - warmup_end))
+    decay_ratio = (step - warmup_end) / float(max(1, horizon - cfg.warmup_iters))
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return cfg.lr_min + coeff * (cfg.lr_max - cfg.lr_min)
 
@@ -309,17 +411,9 @@ def get_lr(step: int, cfg: TrainConfig, start_iter: int = 0) -> float:
 # ── Optimizer ─────────────────────────────────────────────────────────────────
 
 def configure_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
-    """
-    Separa parámetros en dos grupos:
-      - decay:    matrices de pesos >= 2D (excluye embeddings, LayerNorm, biases)
-      - no_decay: todo lo demás, incluidos los embeddings explícitamente sin decay.
-
-    Eliminar weight_decay en los embeddings evita la compresión progresiva de
-    emb_norm_mean que se observó entre iter 200k-300k.
-    """
-    decay_params = []
+    decay_params    = []
     no_decay_params = []
-    seen_ids = set()
+    seen_ids: set   = set()
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -330,7 +424,7 @@ def configure_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optim
 
         is_embedding = "embedding" in name
         is_layernorm = "ln" in name
-        is_bias = name.endswith("bias")
+        is_bias      = name.endswith("bias")
 
         if param.ndim >= 2 and not is_embedding and not is_layernorm and not is_bias:
             decay_params.append(param)
@@ -369,16 +463,7 @@ def maybe_load_checkpoint(
     resume: bool,
     device: str,
     fresh_optimizer: bool = False,
-) -> Tuple[int, Path | None]:
-    """
-    Carga un checkpoint.
-
-    fresh_optimizer=True  →  warm restart: carga los pesos del modelo pero
-                              descarta el estado de Adam (momentos m₁, m₂).
-                              Usar al iniciar un nuevo ciclo de LR para que
-                              Adam no arrastre el momentum del ciclo anterior.
-    fresh_optimizer=False →  comportamiento original: restaura todo el estado.
-    """
+) -> Tuple[int, Optional[Path]]:
     if not resume or not path.exists():
         return 0, None
 
@@ -390,10 +475,9 @@ def maybe_load_checkpoint(
         elif fresh_optimizer:
             print("[INFO] fresh_optimizer=True — momentos de Adam descartados (warm restart)")
         start_iter = int(raw.get("iteration", 0))
-        run_dir = Path(raw["run_dir"]) if "run_dir" in raw else None
+        run_dir    = Path(raw["run_dir"]) if "run_dir" in raw else None
         return start_iter, run_dir
 
-    # Backward compatibility: checkpoint antiguo solo con state_dict
     model.load_state_dict(raw)
     return 0, None
 
@@ -403,11 +487,6 @@ def maybe_load_checkpoint(
 def build_probe_token_cache(
     tokenizer: Tokenizer, device: str
 ) -> Dict[str, torch.Tensor]:
-    """
-    Pre-computa los token IDs de PROBE_WORDS una sola vez al inicio.
-    Usa solo el primer token de cada palabra (igual que compute_probe_metrics).
-    Categorías con menos de 2 tokens son ignoradas.
-    """
     cache: Dict[str, torch.Tensor] = {}
     for category, words in PROBE_WORDS.items():
         ids = []
@@ -418,7 +497,7 @@ def build_probe_token_cache(
         if len(ids) >= 2:
             cache[category] = torch.tensor(ids, dtype=torch.long, device=device)
     n_tokens = sum(len(v) for v in cache.values())
-    print(f"[INFO] probe_cache construido: {len(cache)} categorías, {n_tokens} tokens")
+    print(f"[INFO] probe_cache: {len(cache)} categorías, {n_tokens} tokens")
     return cache
 
 
@@ -427,20 +506,6 @@ def compute_contrastive_loss(
     probe_cache: Dict[str, torch.Tensor],
     temperature: float = 0.07,
 ) -> torch.Tensor:
-    """
-    Pérdida InfoNCE contrastiva sobre los embeddings de PROBE_WORDS.
-
-    Objetivo: maximizar similitud coseno INTRA-categoría y minimizar INTER-categoría.
-    Opera directamente sobre token_embedding_table → el gradiente actualiza los mismos
-    pesos que el LM loss. Con weight_tying=True también afecta al lm_head.
-
-    Matemáticamente, para cada anchor i:
-        L_i = -log( Σ_j∈pos exp(sim(i,j)/τ) / Σ_k≠i exp(sim(i,k)/τ) )
-    donde pos = tokens de la misma categoría que i.
-
-    El peso contrastive_weight debe ser pequeño (0.001–0.01) para que
-    esta pérdida guíe sin sobreponerse al LM loss principal.
-    """
     device = next(model.parameters()).device
     if not probe_cache:
         return torch.tensor(0.0, device=device)
@@ -449,31 +514,25 @@ def compute_contrastive_loss(
     all_labels: List[int] = []
 
     for cat_idx, (category, token_ids) in enumerate(probe_cache.items()):
-        # Acceso directo a la tabla: shape (n_words_in_category, n_embd)
         vecs = model.token_embedding_table.weight[token_ids]
         all_vecs.append(vecs)
         all_labels.extend([cat_idx] * len(token_ids))
 
-    vecs = torch.cat(all_vecs, dim=0)                           # (N, n_embd)
+    vecs   = torch.cat(all_vecs, dim=0)
     labels = torch.tensor(all_labels, dtype=torch.long, device=device)
+    vecs   = F.normalize(vecs, dim=-1)
+    sim    = vecs @ vecs.T / temperature
 
-    # Normalizar para similitud coseno
-    vecs = F.normalize(vecs, dim=-1)
-    sim = vecs @ vecs.T / temperature                           # (N, N)
-
-    N = vecs.shape[0]
+    N   = vecs.shape[0]
     eye = torch.eye(N, dtype=torch.bool, device=device)
 
-    # Máscara: True donde dos tokens son de la misma categoría (excluyendo self)
-    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~eye
-
-    exp_sim = torch.exp(sim)
+    pos_mask       = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~eye
+    exp_sim        = torch.exp(sim)
     exp_sim_no_self = exp_sim.masked_fill(eye, 0.0)
 
-    pos_sum = (exp_sim * pos_mask).sum(dim=-1)                  # (N,)
-    all_sum = exp_sim_no_self.sum(dim=-1)                       # (N,)
+    pos_sum = (exp_sim * pos_mask).sum(dim=-1)
+    all_sum = exp_sim_no_self.sum(dim=-1)
 
-    # Solo calcular para anchors que tienen al menos un positivo
     valid = pos_mask.sum(dim=-1) > 0
     if not valid.any():
         return torch.tensor(0.0, device=device)
@@ -551,7 +610,7 @@ def compute_grad_norm_ratio(current_norm: float, norm_history: List[float]) -> f
 
 
 def compute_embedding_stats(model: GPTModel) -> Dict[str, float]:
-    emb = model.token_embedding_table.weight.detach().float()
+    emb   = model.token_embedding_table.weight.detach().float()
     norms = emb.norm(dim=1)
     return {
         "emb_norm_mean": float(norms.mean().item()),
@@ -588,7 +647,7 @@ def reduce_to_2d(vectors: np.ndarray, random_state: int) -> Tuple[np.ndarray, st
             from sklearn.decomposition import PCA
             return PCA(n_components=2, random_state=random_state).fit_transform(vectors), "pca_fallback"
         except Exception as e2:
-            print(f"[WARN] PCA también falló ({e2}), usando primeras 2 dimensiones.")
+            print(f"[WARN] PCA también falló ({e2}), usando primeras 2 dims.")
             if vectors.shape[1] >= 2:
                 return vectors[:, :2], "raw2d_fallback"
             pad = np.zeros((vectors.shape[0], 2), dtype=vectors.dtype)
@@ -602,14 +661,14 @@ def save_umap_snapshot(
     iteration: int,
     out_dir: Path,
     random_state: int,
-    tokenizer: Tokenizer | None = None,
+    tokenizer: Optional[Tokenizer] = None,
 ) -> str:
     out_dir.mkdir(parents=True, exist_ok=True)
     emb = model.token_embedding_table.weight.detach().cpu().numpy()
 
-    labeled_ids: List[int] = []
+    labeled_ids: List[int]        = []
     labeled_categories: List[str] = []
-    labeled_words: List[str] = []
+    labeled_words: List[str]      = []
 
     if tokenizer is not None:
         for category, words in PROBE_WORDS.items():
@@ -620,17 +679,14 @@ def save_umap_snapshot(
                     labeled_categories.append(category)
                     labeled_words.append(word)
 
-    if not labeled_ids:
-        print(f"[WARN] UMAP: no se encontraron tokens de PROBE_WORDS, usando solo sample aleatorio.")
-
-    labeled_set = set(labeled_ids)
+    labeled_set    = set(labeled_ids)
     background_ids = [int(sid) for sid in sample_ids if int(sid) not in labeled_set]
 
-    all_ids = labeled_ids + background_ids
+    all_ids        = labeled_ids + background_ids
     all_categories = labeled_categories + ["otros"] * len(background_ids)
-    all_words = labeled_words + [""] * len(background_ids)
+    all_words      = labeled_words + [""] * len(background_ids)
 
-    sampled = emb[all_ids]
+    sampled       = emb[all_ids]
     coords, method = reduce_to_2d(sampled, random_state=random_state)
 
     csv_path = out_dir / f"umap_tokens_iter_{iteration:06d}.csv"
@@ -642,21 +698,20 @@ def save_umap_snapshot(
 
     if plt is not None:
         CATEGORY_COLORS = {
-            "personas":      "#990f00",
-            "verbos_ser":    "#ff9f9f",
-            "verbos_accion": "#d34600",
-            "numeros":       "#ffc66b",
-            "colores":       "#ac9714",
-            "lugares":       "#f2ff8e",
-            "tiempo":        "#27a314",
-            "emociones":     "#7feb88",
-            "naturaleza":    "#02029b",
-            "abstractos":    "#6fabe7",
-            "otros":         "#8c16db",
+            "personas":      "#6d0b00",
+            "verbos_ser":    "#ff0000",
+            "verbos_accion": "#825300",
+            "numeros":       "#ff9500",
+            "colores":       "#1aff00",
+            "lugares":       "#006205",
+            "tiempo":        "#64FFE3",
+            "emociones":     "#0600b8",
+            "naturaleza":    "#730ed7",
+            "abstractos":    "#ff00cc",
+            "otros":         "#bdc3c7",
         }
-
         coords_arr = np.array(coords) if not isinstance(coords, np.ndarray) else coords
-        fig, ax = plt.subplots(figsize=(10, 8))
+        fig, ax    = plt.subplots(figsize=(10, 8))
 
         bg_mask = [i for i, c in enumerate(all_categories) if c == "otros"]
         if bg_mask:
@@ -669,11 +724,11 @@ def save_umap_snapshot(
             if not cat_mask:
                 continue
             cat_coords = coords_arr[cat_mask]
-            color = CATEGORY_COLORS.get(category, "#9b59b6")
+            color = CATEGORY_COLORS.get(category, "#bdc3c7")
             ax.scatter(cat_coords[:, 0], cat_coords[:, 1],
                        s=80, alpha=0.95, color=color, label=category,
                        edgecolors="white", linewidths=0.5, zorder=5)
-            for i, mask_i in enumerate(cat_mask):
+            for mask_i in cat_mask:
                 ax.annotate(
                     all_words[mask_i],
                     (coords_arr[mask_i, 0], coords_arr[mask_i, 1]),
@@ -689,24 +744,24 @@ def save_umap_snapshot(
         fig.savefig(out_dir / f"umap_tokens_iter_{iteration:06d}.png", dpi=160)
         plt.close(fig)
 
-    print(f"[INFO] UMAP snapshot guardado en iter={iteration} método={method} anclas={len(labeled_ids)}")
+    print(f"[INFO] UMAP snapshot iter={iteration} método={method} anclas={len(labeled_ids)}")
     return method
 
 
 # ── Probe semántico ───────────────────────────────────────────────────────────
 
-def compute_probe_metrics(model: GPTModel, tokenizer: Tokenizer | None) -> Dict[str, float]:
+def compute_probe_metrics(model: GPTModel, tokenizer: Optional[Tokenizer]) -> Dict[str, float]:
+    empty = {
+        "probe_intra_cos":  float("nan"),
+        "probe_inter_cos":  float("nan"),
+        "probe_gap":        float("nan"),
+        "probe_knn_purity": float("nan"),
+    }
     if tokenizer is None:
-        return {
-            "probe_intra_cos":  float("nan"),
-            "probe_inter_cos":  float("nan"),
-            "probe_gap":        float("nan"),
-            "probe_knn_purity": float("nan"),
-        }
+        return empty
 
     emb_table = model.token_embedding_table.weight.detach().cpu()
-    vectors = []
-    labels = []
+    vectors, labels = [], []
     for category, words in PROBE_WORDS.items():
         for word in words:
             ids = tokenizer.encode(word).ids
@@ -717,17 +772,12 @@ def compute_probe_metrics(model: GPTModel, tokenizer: Tokenizer | None) -> Dict[
             labels.append(category)
 
     if len(vectors) < 4:
-        return {
-            "probe_intra_cos":  float("nan"),
-            "probe_inter_cos":  float("nan"),
-            "probe_gap":        float("nan"),
-            "probe_knn_purity": float("nan"),
-        }
+        return empty
 
-    mat = np.vstack(vectors)
+    mat  = np.vstack(vectors)
     norm = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
-    mat = mat / norm
-    cos = mat @ mat.T
+    mat  = mat / norm
+    cos  = mat @ mat.T
 
     intra_vals, inter_vals = [], []
     for i in range(len(labels)):
@@ -739,16 +789,15 @@ def compute_probe_metrics(model: GPTModel, tokenizer: Tokenizer | None) -> Dict[
 
     intra = float(np.mean(intra_vals)) if intra_vals else float("nan")
     inter = float(np.mean(inter_vals)) if inter_vals else float("nan")
-    gap = intra - inter if not (math.isnan(intra) or math.isnan(inter)) else float("nan")
+    gap   = intra - inter if not (math.isnan(intra) or math.isnan(inter)) else float("nan")
 
     knn_hits = 0
     for i in range(len(labels)):
         sim = cos[i].copy()
         sim[i] = -1.0
-        nn_idx = np.argsort(sim)[-3:]
+        nn_idx    = np.argsort(sim)[-3:]
         nn_labels = [labels[k] for k in nn_idx]
-        hits = sum(1 for lbl in nn_labels if lbl == labels[i])
-        if hits >= 2:
+        if sum(1 for lbl in nn_labels if lbl == labels[i]) >= 2:
             knn_hits += 1
     purity = knn_hits / float(len(labels))
 
@@ -764,7 +813,7 @@ def compute_probe_metrics(model: GPTModel, tokenizer: Tokenizer | None) -> Dict[
 
 def detect_grokking_like(
     history: List[Dict[str, float]], max_iters: int
-) -> Dict[str, float | bool]:
+) -> Dict[str, object]:
     if len(history) < 8:
         return {"grokking_like": False, "val_improvement_after_train_low": 0.0, "delay_iters": 0.0}
 
@@ -776,51 +825,49 @@ def detect_grokking_like(
     if np.isnan(train_losses).any() or np.isnan(val_losses).any():
         return {"grokking_like": False, "val_improvement_after_train_low": 0.0, "delay_iters": 0.0}
 
-    low_threshold = np.percentile(train_losses, 25)
-    low_idx = np.where(train_losses <= low_threshold)[0]
-    if len(low_idx) == 0:
-        return {"grokking_like": False, "val_improvement_after_train_low": 0.0, "delay_iters": 0.0}
-    start = int(low_idx[0])
-    if start >= len(train_losses) - 2:
+    low_threshold  = np.percentile(train_losses, 25)
+    low_idx        = np.where(train_losses <= low_threshold)[0]
+    if len(low_idx) == 0 or low_idx[0] >= len(train_losses) - 2:
         return {"grokking_like": False, "val_improvement_after_train_low": 0.0, "delay_iters": 0.0}
 
-    val_at_start   = float(val_losses[start])
+    start          = int(low_idx[0])
     best_after_idx = start + int(np.argmin(val_losses[start:]))
+    val_at_start   = float(val_losses[start])
     best_after_val = float(val_losses[best_after_idx])
     delay_iters    = float(iters[best_after_idx] - iters[start])
     val_improvement = (val_at_start - best_after_val) / max(1e-8, val_at_start)
 
-    gap_start = float(probe_gaps[start])        if not math.isnan(float(probe_gaps[start]))        else 0.0
+    gap_start = float(probe_gaps[start])          if not math.isnan(float(probe_gaps[start]))          else 0.0
     gap_end   = float(probe_gaps[best_after_idx]) if not math.isnan(float(probe_gaps[best_after_idx])) else gap_start
     gap_gain  = gap_end - gap_start
 
     grokking_like = bool(
-        delay_iters    > 0.1 * max(1, max_iters) and
+        delay_iters > 0.1 * max(1, max_iters) and
         val_improvement > 0.15 and
         gap_gain > 0.0
     )
     return {
-        "grokking_like":                    grokking_like,
-        "val_improvement_after_train_low":  float(val_improvement),
-        "delay_iters":                      delay_iters,
-        "probe_gap_gain":                   float(gap_gain),
+        "grokking_like":                   grokking_like,
+        "val_improvement_after_train_low": float(val_improvement),
+        "delay_iters":                     delay_iters,
+        "probe_gap_gain":                  float(gap_gain),
     }
 
 
-# ── Validación / documentación ────────────────────────────────────────────────
+# ── Validación ────────────────────────────────────────────────────────────────
 
 def validate_embedding_size(cfg: TrainConfig) -> Dict[str, str]:
     checks: Dict[str, str] = {}
-    checks["n_embd_multiple_of_n_head"] = "ok" if cfg.n_embd % cfg.n_head == 0 else "fail"
+    checks["n_embd_multiple_of_n_head"] = "ok" if cfg.n_embd % cfg.n_head == 0 else "FAIL"
     head_dim = cfg.n_embd // cfg.n_head if cfg.n_head > 0 else -1
-    checks["head_dim"] = str(head_dim)
+    checks["head_dim"]       = str(head_dim)
     checks["head_dim_range"] = "ok" if 16 <= head_dim <= 128 else "warn"
 
-    emb_params   = cfg.vocab_size * cfg.n_embd
-    emb_mem_mb   = emb_params * 4 / (1024 ** 2)
-    checks["token_embedding_params"]          = str(emb_params)
-    checks["token_embedding_memory_mb_fp32"]  = f"{emb_mem_mb:.2f}"
-    checks["token_embedding_memory_mb_fp16"]  = f"{emb_mem_mb / 2.0:.2f}"
+    emb_params = cfg.vocab_size * cfg.n_embd
+    emb_mem_mb = emb_params * 4 / (1024 ** 2)
+    checks["token_embedding_params"]         = str(emb_params)
+    checks["token_embedding_memory_mb_fp32"] = f"{emb_mem_mb:.2f}"
+    checks["token_embedding_memory_mb_fp16"] = f"{emb_mem_mb / 2.0:.2f}"
     checks["embedding_size_comment"] = (
         "very_large" if emb_mem_mb > 4096 else
         "large"      if emb_mem_mb > 1024 else
@@ -831,21 +878,38 @@ def validate_embedding_size(cfg: TrainConfig) -> Dict[str, str]:
 
 def write_parameter_explainer(cfg: TrainConfig, validation: Dict[str, str], out_path: Path) -> None:
     reasons = {
-        "batch_size":       "Controla estabilidad de gradiente vs memoria. 16 es un punto medio.",
-        "block_size":       "Contexto maximo visible por token. 128 permite dependencias mas largas.",
-        "vocab_size":       "Debe cubrir el rango de IDs en train.bin (uint16 -> hasta 65535).",
-        "n_embd":           "Capacidad de representacion por token. 768 igual que GPT-2 small.",
-        "n_head":           "Subespacios de atencion en paralelo. 12 deja head_dim=64.",
-        "n_layer":          "Profundidad del Transformer. 12 igual que GPT-2 small.",
-        "fresh_optimizer":  "Warm restart: descarta momentos de Adam para reiniciar el schedule de LR.",
-        "contrastive_weight": "Peso de la pérdida contrastiva InfoNCE. 0 = desactivada.",
-        "lr_max/lr_min":    "Warmup + cosine decay para convergencia mas estable.",
-        "weight_decay":     "Regulariza matrices y reduce sobreajuste. Sin decay en embeddings.",
-        "grad_clip":        "Evita exploding gradients.",
-        "eval_interval":    "Frecuencia para observar train/val y posible grokking.",
-        "umap_interval":    "Frecuencia de snapshots para ver evolucion geometrica.",
+        "batch_size":             "Equilibrio gradiente vs memoria. 8 es conservador para Medium.",
+        "block_size":             "Contexto de 256 tokens; el doble que el Small original.",
+        "vocab_size":             "Cubre uint16 (hasta 65535).",
+        "n_embd":                 "768→1024: capacidad de representación GPT-2 Medium.",
+        "n_head":                 "16 cabezas, head_dim=64, igual que GPT-2 original.",
+        "n_layer":                "24 capas vs 12 del Small: más profundidad de razonamiento.",
+        "lr_horizon":             "Horizonte del cosine LR. Independiente de cuándo para el training.",
+        "patience":               "Evaluaciones sin mejora antes de declarar convergencia.",
+        "fresh_optimizer":        "Warm restart: descarta momentos de Adam.",
+        "contrastive_weight":     "Peso InfoNCE contrastiva. 0 = desactivada.",
+        "lr_max/lr_min":          "Warmup + cosine decay. lr_max más bajo que Small para 24 capas.",
+        "warmup_iters":           "1000 iters de warmup para estabilizar un modelo más profundo.",
+        "weight_decay":           "Regulariza matrices, no embeddings.",
+        "grad_clip":              "Clipping en 1.0 previene explosión de gradientes.",
+        "grad_norm_warn_threshold": "Avisa si el grad norm supera este umbral sostenidamente.",
     }
-    lines = ["# GPT2 experiment parameter guide", "", "## Why these values", ""]
+    lines = [
+        "# GPT-2 Medium experiment — parameter guide",
+        "",
+        "## Architecture vs Small",
+        "",
+        "| Param | Small | Medium |",
+        "|---|---|---|",
+        "| n_embd | 768 | 1024 |",
+        "| n_head | 12  | 16   |",
+        "| n_layer | 12 | 24   |",
+        "| block_size | 128 | 256 |",
+        "| Params | ~117M | ~345M |",
+        "",
+        "## Why these values",
+        "",
+    ]
     for key, value in reasons.items():
         lines.append(f"- `{key}`: {value}")
     lines.extend(["", "## Embedding size validation", ""])
@@ -861,68 +925,56 @@ def write_parameter_explainer(cfg: TrainConfig, validation: Dict[str, str], out_
 
 class MetricsLogger:
     def __init__(self, run_dir: Path):
-        self.run_dir = run_dir
+        self.run_dir     = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
-
-        self.train_path      = self.run_dir / "train_metrics.csv"
-        self.grad_path       = self.run_dir / "grad_norms_by_layer.csv"
-        self.validation_path = self.run_dir / "config_validation.json"
+        self.train_path  = self.run_dir / "train_metrics.csv"
+        self.grad_path   = self.run_dir / "grad_norms_by_layer.csv"
+        self.val_path    = self.run_dir / "config_validation.json"
 
         if not self.train_path.exists():
             with self.train_path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
+                csv.writer(f).writerow([
                     "iter", "train_loss", "val_loss", "lr", "global_grad_norm",
                     "probe_intra_cos", "probe_inter_cos", "probe_gap", "probe_knn_purity",
-                    "umap_method",
-                    "perplexity", "bits_per_char", "tokens_per_sec",
+                    "umap_method", "perplexity", "bits_per_char", "tokens_per_sec",
                     "param_norm", "grad_norm_ratio", "loss_spike_count",
                     "emb_norm_mean", "emb_norm_std", "emb_norm_min", "emb_norm_max",
-                    # Nueva columna para seguimiento de la pérdida contrastiva
                     "contrastive_loss",
                 ])
         else:
-            print(f"[INFO] MetricsLogger: train_metrics.csv existente, continuando en modo append.")
+            print("[INFO] MetricsLogger: train_metrics.csv existente → modo append.")
 
         if not self.grad_path.exists():
             with self.grad_path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["iter", "layer_name", "grad_norm", "delta_vs_prev"])
+                csv.writer(f).writerow(["iter", "layer_name", "grad_norm", "delta_vs_prev"])
         else:
-            print(f"[INFO] MetricsLogger: grad_norms_by_layer.csv existente, continuando en modo append.")
+            print("[INFO] MetricsLogger: grad_norms_by_layer.csv existente → modo append.")
 
     def write_validation(self, validation: Dict[str, str]) -> None:
-        self.validation_path.write_text(json.dumps(validation, indent=2), encoding="utf-8")
+        self.val_path.write_text(json.dumps(validation, indent=2), encoding="utf-8")
 
     def log_train(
-        self,
-        iteration: int,
-        train_loss: float,
-        val_loss: float,
-        lr: float,
-        global_grad_norm: float,
-        probe: Dict[str, float],
-        umap_method: str,
-        extra: Dict[str, float] | None = None,
+        self, iteration: int, train_loss: float, val_loss: float,
+        lr: float, global_grad_norm: float, probe: Dict[str, float],
+        umap_method: str, extra: Optional[Dict[str, float]] = None,
     ) -> None:
         ex = extra or {}
         with self.train_path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
+            csv.writer(f).writerow([
                 iteration, train_loss, val_loss, lr, global_grad_norm,
                 probe["probe_intra_cos"], probe["probe_inter_cos"],
                 probe["probe_gap"], probe["probe_knn_purity"], umap_method,
-                ex.get("perplexity",        float("nan")),
-                ex.get("bits_per_char",     float("nan")),
-                ex.get("tokens_per_sec",    float("nan")),
-                ex.get("param_norm",        float("nan")),
-                ex.get("grad_norm_ratio",   float("nan")),
-                ex.get("loss_spike_count",  float("nan")),
-                ex.get("emb_norm_mean",     float("nan")),
-                ex.get("emb_norm_std",      float("nan")),
-                ex.get("emb_norm_min",      float("nan")),
-                ex.get("emb_norm_max",      float("nan")),
-                ex.get("contrastive_loss",  float("nan")),
+                ex.get("perplexity",       float("nan")),
+                ex.get("bits_per_char",    float("nan")),
+                ex.get("tokens_per_sec",   float("nan")),
+                ex.get("param_norm",       float("nan")),
+                ex.get("grad_norm_ratio",  float("nan")),
+                ex.get("loss_spike_count", float("nan")),
+                ex.get("emb_norm_mean",    float("nan")),
+                ex.get("emb_norm_std",     float("nan")),
+                ex.get("emb_norm_min",     float("nan")),
+                ex.get("emb_norm_max",     float("nan")),
+                ex.get("contrastive_loss", float("nan")),
             ])
 
     def log_gradients(
@@ -933,7 +985,7 @@ class MetricsLogger:
             writer = csv.writer(f)
             for layer_name in sorted(current.keys()):
                 grad_norm = current[layer_name]
-                delta = grad_norm - previous.get(layer_name, 0.0)
+                delta     = grad_norm - previous.get(layer_name, 0.0)
                 writer.writerow([iteration, layer_name, grad_norm, delta])
 
 
@@ -956,8 +1008,8 @@ def load_history_from_csv(train_path: Path) -> List[Dict[str, float]]:
             except (KeyError, ValueError):
                 continue
     if history:
-        print(f"[INFO] Historial recargado desde CSV: {len(history)} entradas "
-              f"(iter {int(history[0]['iter'])}→{int(history[-1]['iter'])})")
+        print(f"[INFO] Historial CSV: {len(history)} entradas "
+              f"iter {int(history[0]['iter'])}→{int(history[-1]['iter'])}")
     return history
 
 
@@ -968,9 +1020,88 @@ def build_run_dir(output_root: Path, run_name: str) -> Path:
     return output_root / f"run_{stamp}"
 
 
+# ── Finalización (checkpoint + reporte) ──────────────────────────────────────
+
+def finalize_training(
+    *,
+    model: GPTModel,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    run_dir: Path,
+    cfg: TrainConfig,
+    history: List[Dict[str, float]],
+    tokenizer: Optional[Tokenizer],
+    checkpoint_path: Path,
+    stop_reason: str,
+    device: str,
+) -> None:
+    """
+    Guarda el checkpoint final, genera el texto de muestra, calcula la
+    heurística de grokking y lanza el reporte automático.
+
+    Se llama tanto en finalización normal como cuando se recibe una señal
+    de interrupción (Ctrl+C / SIGTERM). De esta forma nunca se pierde el
+    estado del entrenamiento.
+    """
+    print(f"\n[FINALIZE] Motivo de parada: {stop_reason}")
+    print(f"[FINALIZE] Guardando checkpoint final (iter={iteration})...")
+
+    save_checkpoint(
+        path=checkpoint_path, model=model, optimizer=optimizer,
+        iteration=iteration, run_dir=run_dir, cfg=cfg,
+    )
+    print(f"[FINALIZE] Checkpoint guardado → {checkpoint_path}")
+
+    # Guardar motivo de parada
+    stop_info = {
+        "stop_reason": stop_reason,
+        "final_iter":  iteration,
+        "timestamp":   time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    (run_dir / "stop_info.json").write_text(json.dumps(stop_info, indent=2), encoding="utf-8")
+
+    # Grokking heuristic
+    effective_iters = iteration if cfg.max_iters < 0 else cfg.max_iters
+    grok = detect_grokking_like(history, max_iters=effective_iters)
+    (run_dir / "grokking_heuristic.json").write_text(json.dumps(grok, indent=2), encoding="utf-8")
+    print(f"[FINALIZE] grokking → {grok}")
+
+    # Generación de texto de muestra
+    if tokenizer is not None and cfg.generate_tokens > 0:
+        model.eval()
+        context = torch.zeros((1, 1), dtype=torch.long, device=device)
+        with torch.no_grad():
+            generated_ids = model.generate(context, cfg.generate_tokens)[0].tolist()
+        text     = tokenizer.decode(generated_ids)
+        gen_path = run_dir / "sample_generation.txt"
+        gen_path.write_text(text, encoding="utf-8")
+        print(f"[FINALIZE] Muestra guardada → {gen_path}")
+        print(f"[FINALIZE] sample: {text[:200]}")
+        model.train()
+
+    # Reporte / presentación automática
+    if cfg.auto_presentation:
+        try:
+            from presentation_report import generate_presentation
+            outputs = generate_presentation(run_dir=run_dir, run_name=run_dir.name)
+            print(f"[FINALIZE] Presentación → {outputs.get('pdf')}")
+            print(f"[FINALIZE] Resumen      → {outputs.get('markdown')}")
+        except Exception as exc:
+            print(f"[WARN] No se pudo generar la presentación: {exc}")
+
+    print("[FINALIZE] Listo. Puedes revisar los artefactos en:", run_dir)
+
+
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train(cfg: TrainConfig) -> None:
+    global _shutdown_requested
+    _shutdown_requested = False
+
+    # Registrar handlers de señal
+    signal.signal(signal.SIGINT,  _handle_shutdown_signal)
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
@@ -978,12 +1109,17 @@ def train(cfg: TrainConfig) -> None:
 
     device = select_device(cfg.device)
     amp    = resolve_amp_settings(cfg, device)
-    print(f"[INFO] device    = {device}")
-    print(f"[INFO] precision = requested:{cfg.precision} "
-          f"amp_enabled:{amp.enabled} dtype:{amp.dtype} grad_scaler:{amp.use_grad_scaler}")
-    print(f"[INFO] fresh_optimizer      = {cfg.fresh_optimizer}")
-    print(f"[INFO] contrastive_weight   = {cfg.contrastive_weight}")
-    print(f"[INFO] contrastive_interval = {cfg.contrastive_interval}")
+
+    print(f"[INFO] device              = {device}")
+    print(f"[INFO] precision           = requested:{cfg.precision} "
+          f"amp:{amp.enabled} dtype:{amp.dtype} scaler:{amp.use_grad_scaler}")
+    print(f"[INFO] arquitectura        = n_embd={cfg.n_embd} n_head={cfg.n_head} "
+          f"n_layer={cfg.n_layer} block_size={cfg.block_size}")
+    print(f"[INFO] convergencia        = patience={cfg.patience} min_delta={cfg.min_delta} "
+          f"lr_horizon={cfg.lr_horizon}")
+    print(f"[INFO] max_iters           = {'∞ (hasta convergencia)' if cfg.max_iters < 0 else cfg.max_iters}")
+    print(f"[INFO] fresh_optimizer     = {cfg.fresh_optimizer}")
+    print(f"[INFO] contrastive_weight  = {cfg.contrastive_weight}")
 
     train_ds = BinTokenDataset(cfg.train_bin)
     val_ds   = BinTokenDataset(cfg.val_bin)
@@ -1001,28 +1137,22 @@ def train(cfg: TrainConfig) -> None:
         Path(cfg.output_root), cfg.run_name
     )
 
-    if start_iter > 0:
-        cfg.max_iters = start_iter + cfg.max_iters
-        print(f"[INFO] Resume detectado: max_iters ajustado a {cfg.max_iters} (start={start_iter})")
-
-    logger = MetricsLogger(run_dir)
-
+    logger     = MetricsLogger(run_dir)
     validation = validate_embedding_size(cfg)
     logger.write_validation(validation)
     write_parameter_explainer(cfg, validation, run_dir / "parameter_guide.md")
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"[INFO] params    = {total_params / 1e6:.2f}M")
-    print(f"[INFO] run_dir   = {run_dir}")
-    print(f"[INFO] start_iter = {start_iter}")
+    print(f"[INFO] params              = {total_params / 1e6:.2f}M")
+    print(f"[INFO] run_dir             = {run_dir}")
+    print(f"[INFO] start_iter          = {start_iter}")
 
-    tokenizer = None
+    tokenizer: Optional[Tokenizer] = None
     try:
         tokenizer = Tokenizer.from_file(cfg.tokenizer_path)
     except Exception as exc:
-        print(f"[WARN] tokenizer could not be loaded ({cfg.tokenizer_path}): {exc}")
+        print(f"[WARN] Tokenizer no cargado ({cfg.tokenizer_path}): {exc}")
 
-    # ── Cache de tokens de probe para la pérdida contrastiva ─────────────────
     probe_cache: Dict[str, torch.Tensor] = {}
     if tokenizer is not None and cfg.contrastive_weight > 0:
         probe_cache = build_probe_token_cache(tokenizer, device)
@@ -1034,14 +1164,38 @@ def train(cfg: TrainConfig) -> None:
     grad_norm_history: List[float]    = []
     history: List[Dict[str, float]]   = load_history_from_csv(logger.train_path)
 
-    last_train_loss      = float("nan")
+    convergence = ConvergenceTracker(patience=cfg.patience, min_delta=cfg.min_delta)
+    # Si hay historial previo, inicializar el mejor val_loss conocido
+    if history:
+        known_best = min(r["val_loss"] for r in history if not math.isnan(r["val_loss"]))
+        convergence.best_val_loss = known_best
+        print(f"[INFO] Mejor val_loss conocido del historial: {known_best:.4f}")
+
+    last_train_loss       = float("nan")
     last_global_grad_norm = float("nan")
     last_contrastive_loss = float("nan")
+    stop_reason           = "max_iters"
 
     model.train()
-    timer = time.time()
+    timer     = time.time()
+    iteration = start_iter
 
-    for iteration in range(start_iter, cfg.max_iters):
+    print("\n[TRAIN] Iniciando loop de entrenamiento...")
+    print("[TRAIN] Ctrl+C o SIGTERM → guarda checkpoint + genera reporte y termina limpiamente.\n")
+
+    while True:
+        # ── Condición de parada: señal externa ───────────────────────────────
+        if _shutdown_requested:
+            stop_reason = "signal_interrupt"
+            print(f"\n[TRAIN] Interrupción recibida en iter={iteration}. Finalizando...")
+            break
+
+        # ── Condición de parada: límite duro de iteraciones ──────────────────
+        if cfg.max_iters > 0 and iteration >= cfg.max_iters:
+            stop_reason = "max_iters_reached"
+            break
+
+        # ── Forward + backward ───────────────────────────────────────────────
         xb, yb = train_ds.get_batch(cfg.block_size, cfg.batch_size)
         xb = xb.to(device)
         yb = yb.to(device)
@@ -1055,9 +1209,6 @@ def train(cfg: TrainConfig) -> None:
         with torch.autocast(device_type=amp.device_type, dtype=amp.dtype, enabled=amp.enabled):
             _, loss = model(xb, yb)
 
-            # ── Pérdida contrastiva ──────────────────────────────────────────
-            # Se añade cada contrastive_interval pasos para no dominar el LM loss
-            # y para no duplicar el tiempo de cómputo en cada paso.
             if probe_cache and cfg.contrastive_weight > 0 \
                     and iteration % cfg.contrastive_interval == 0:
                 loss_c = compute_contrastive_loss(
@@ -1065,10 +1216,9 @@ def train(cfg: TrainConfig) -> None:
                 )
                 last_contrastive_loss = float(loss_c.item())
                 loss = loss + cfg.contrastive_weight * loss_c
-            # ────────────────────────────────────────────────────────────────
 
         if loss is None:
-            raise RuntimeError("Loss became None durante el entrenamiento.")
+            raise RuntimeError("Loss es None durante el entrenamiento.")
 
         if amp.use_grad_scaler:
             scaler.scale(loss).backward()
@@ -1096,20 +1246,25 @@ def train(cfg: TrainConfig) -> None:
         last_train_loss       = float(loss.item())
         last_global_grad_norm = global_grad_norm
 
-        should_eval = (iteration % cfg.eval_interval == 0) or (iteration == cfg.max_iters - 1)
+        # Advertencia de gradientes inestables (no detiene, solo avisa)
+        if global_grad_norm > cfg.grad_norm_warn_threshold:
+            print(
+                f"[GRAD WARN] iter={iteration} grad_norm={global_grad_norm:.3f} "
+                f"(umbral={cfg.grad_norm_warn_threshold}) — clipping activo, monitoreando..."
+            )
+
+        # ── Evaluación periódica ──────────────────────────────────────────────
+        should_eval = (iteration % cfg.eval_interval == 0) or _shutdown_requested
         if should_eval:
-            val_loss     = evaluate_loss(model, val_ds, cfg, device=device, amp=amp)
+            val_loss      = evaluate_loss(model, val_ds, cfg, device=device, amp=amp)
             probe_metrics = compute_probe_metrics(model, tokenizer)
             umap_method   = "not_run"
 
             if cfg.umap_interval > 0 and (iteration % cfg.umap_interval == 0):
                 umap_method = save_umap_snapshot(
-                    model=model,
-                    sample_ids=sample_ids,
-                    iteration=iteration,
+                    model=model, sample_ids=sample_ids, iteration=iteration,
                     out_dir=run_dir / "umap_snapshots",
-                    random_state=cfg.umap_random_state,
-                    tokenizer=tokenizer,
+                    random_state=cfg.umap_random_state, tokenizer=tokenizer,
                 )
 
             perplexity      = compute_perplexity(val_loss)
@@ -1134,85 +1289,64 @@ def train(cfg: TrainConfig) -> None:
             timer   = time.time()
 
             extra_metrics = {
-                "perplexity":         perplexity,
-                "bits_per_char":      bits_per_char,
-                "tokens_per_sec":     tps,
-                "param_norm":         param_norm,
-                "grad_norm_ratio":    grad_norm_ratio,
-                "loss_spike_count":   float(spike_count),
-                "contrastive_loss":   last_contrastive_loss,
+                "perplexity":       perplexity,
+                "bits_per_char":    bits_per_char,
+                "tokens_per_sec":   tps,
+                "param_norm":       param_norm,
+                "grad_norm_ratio":  grad_norm_ratio,
+                "loss_spike_count": float(spike_count),
+                "contrastive_loss": last_contrastive_loss,
                 **emb_stats,
             }
 
             logger.log_train(
-                iteration=iteration,
-                train_loss=last_train_loss,
-                val_loss=val_loss,
-                lr=lr,
-                global_grad_norm=last_global_grad_norm,
-                probe=probe_metrics,
-                umap_method=umap_method,
-                extra=extra_metrics,
+                iteration=iteration, train_loss=last_train_loss, val_loss=val_loss,
+                lr=lr, global_grad_norm=last_global_grad_norm,
+                probe=probe_metrics, umap_method=umap_method, extra=extra_metrics,
             )
 
             print(
                 f"[iter {iteration:06d}] "
-                f"train_loss={last_train_loss:.4f} "
-                f"val_loss={val_loss:.4f} "
-                f"ppl={perplexity:.1f} "
-                f"bpc={bits_per_char:.4f} "
-                f"lr={lr:.2e} "
-                f"grad_norm={last_global_grad_norm:.4f} "
-                f"grad_ratio={grad_norm_ratio:.2f} "
-                f"param_norm={param_norm:.1f} "
+                f"train={last_train_loss:.4f} val={val_loss:.4f} "
+                f"ppl={perplexity:.1f} bpc={bits_per_char:.4f} "
+                f"lr={lr:.2e} grad={last_global_grad_norm:.4f} "
+                f"ratio={grad_norm_ratio:.2f} "
                 f"emb_mean={emb_stats['emb_norm_mean']:.4f} "
-                f"emb_std={emb_stats['emb_norm_std']:.4f} "
-                f"spikes={spike_count} "
-                f"probe_gap={probe_metrics['probe_gap']:.4f} "
+                f"gap={probe_metrics['probe_gap']:.4f} "
                 f"knn={probe_metrics['probe_knn_purity']:.3f} "
-                f"c_loss={last_contrastive_loss:.4f} "
+                f"c={last_contrastive_loss:.4f} "
                 f"tps={tps:.0f} "
-                f"umap={umap_method} "
-                f"dt={elapsed:.2f}s"
+                f"spikes={spike_count} "
+                f"umap={umap_method} dt={elapsed:.1f}s | "
+                f"no_improve={convergence.no_improve_count}/{cfg.patience}"
             )
 
+            # ── Condición de convergencia ─────────────────────────────────────
+            if not _shutdown_requested and convergence.update(val_loss, iteration):
+                stop_reason = "convergence"
+                print(
+                    f"\n[CONVERGENCIA] Val loss no mejoró en {cfg.patience} evaluaciones. "
+                    f"Mejor val_loss={convergence.best_val_loss:.4f} en iter={convergence.best_iter}."
+                )
+                break
+
+        # ── Checkpoint periódico ──────────────────────────────────────────────
         if iteration > 0 and (iteration % cfg.save_interval == 0):
             save_checkpoint(
                 path=checkpoint_path, model=model, optimizer=optimizer,
                 iteration=iteration, run_dir=run_dir, cfg=cfg,
             )
-            print(f"[INFO] checkpoint saved at iter={iteration} -> {checkpoint_path}")
+            print(f"[CKPT] Guardado iter={iteration} → {checkpoint_path}")
 
-    # ── Checkpoint final ──────────────────────────────────────────────────────
-    save_checkpoint(
-        path=checkpoint_path, model=model, optimizer=optimizer,
-        iteration=max(0, cfg.max_iters - 1), run_dir=run_dir, cfg=cfg,
+        iteration += 1
+
+    # ── Finalización (siempre se ejecuta, incluso con Ctrl+C) ────────────────
+    finalize_training(
+        model=model, optimizer=optimizer, iteration=iteration,
+        run_dir=run_dir, cfg=cfg, history=history,
+        tokenizer=tokenizer, checkpoint_path=checkpoint_path,
+        stop_reason=stop_reason, device=device,
     )
-    print(f"[INFO] final checkpoint saved -> {checkpoint_path}")
-
-    grok = detect_grokking_like(history, max_iters=cfg.max_iters)
-    (run_dir / "grokking_heuristic.json").write_text(json.dumps(grok, indent=2), encoding="utf-8")
-    print(f"[INFO] grokking heuristic -> {grok}")
-
-    if tokenizer is not None and cfg.generate_tokens > 0:
-        model.eval()
-        context = torch.zeros((1, 1), dtype=torch.long, device=device)
-        with torch.no_grad():
-            generated_ids = model.generate(context, cfg.generate_tokens)[0].tolist()
-        text = tokenizer.decode(generated_ids)
-        gen_path = run_dir / "sample_generation.txt"
-        gen_path.write_text(text, encoding="utf-8")
-        print(f"[INFO] sample generation saved -> {gen_path}")
-        print(f"[INFO] sample: {text[:200]}")
-
-    if cfg.auto_presentation:
-        try:
-            from presentation_report import generate_presentation
-            outputs = generate_presentation(run_dir=run_dir, run_name=run_dir.name)
-            print(f"[INFO] presentation generated -> {outputs.get('pdf')}")
-            print(f"[INFO] presentation summary   -> {outputs.get('markdown')}")
-        except Exception as exc:
-            print(f"[WARN] could not generate presentation automatically: {exc}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1220,18 +1354,25 @@ def train(cfg: TrainConfig) -> None:
 def parse_args() -> TrainConfig:
     cfg = TrainConfig()
     parser = argparse.ArgumentParser(
-        description="Instrumented GPT2-style training with warm restart and contrastive loss."
+        description="GPT-2 Medium training con convergencia automática y shutdown limpio."
     )
     # Arquitectura
-    parser.add_argument("--n-embd",       type=int,   default=cfg.n_embd)
-    parser.add_argument("--n-head",       type=int,   default=cfg.n_head)
-    parser.add_argument("--n-layer",      type=int,   default=cfg.n_layer)
-    parser.add_argument("--block-size",   type=int,   default=cfg.block_size)
-    parser.add_argument("--dropout",      type=float, default=cfg.dropout)
+    parser.add_argument("--n-embd",          type=int,   default=cfg.n_embd)
+    parser.add_argument("--n-head",          type=int,   default=cfg.n_head)
+    parser.add_argument("--n-layer",         type=int,   default=cfg.n_layer)
+    parser.add_argument("--block-size",      type=int,   default=cfg.block_size)
+    parser.add_argument("--dropout",         type=float, default=cfg.dropout)
     parser.add_argument("--no-weight-tying", action="store_true")
     # Training
     parser.add_argument("--batch-size",        type=int,   default=cfg.batch_size)
-    parser.add_argument("--max-iters",         type=int,   default=cfg.max_iters)
+    parser.add_argument("--max-iters",         type=int,   default=cfg.max_iters,
+                        help="-1 = correr hasta convergencia (default)")
+    parser.add_argument("--lr-horizon",        type=int,   default=cfg.lr_horizon,
+                        help="Horizonte del cosine LR schedule (independiente de max_iters)")
+    parser.add_argument("--patience",          type=int,   default=cfg.patience,
+                        help="Evaluaciones sin mejora antes de parar")
+    parser.add_argument("--min-delta",         type=float, default=cfg.min_delta,
+                        help="Mejora mínima de val_loss para considerar progreso")
     parser.add_argument("--eval-interval",     type=int,   default=cfg.eval_interval)
     parser.add_argument("--save-interval",     type=int,   default=cfg.save_interval)
     parser.add_argument("--eval-batches",      type=int,   default=cfg.eval_batches)
@@ -1239,39 +1380,28 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--umap-interval",     type=int,   default=cfg.umap_interval)
     parser.add_argument("--umap-sample-size",  type=int,   default=cfg.umap_sample_size)
     # LR / optimizer
-    parser.add_argument("--lr-max",       type=float, default=cfg.lr_max)
-    parser.add_argument("--lr-min",       type=float, default=cfg.lr_min)
-    parser.add_argument("--warmup-iters", type=int,   default=cfg.warmup_iters)
-    parser.add_argument("--weight-decay", type=float, default=cfg.weight_decay)
-    parser.add_argument("--grad-clip",    type=float, default=cfg.grad_clip)
+    parser.add_argument("--lr-max",               type=float, default=cfg.lr_max)
+    parser.add_argument("--lr-min",               type=float, default=cfg.lr_min)
+    parser.add_argument("--warmup-iters",         type=int,   default=cfg.warmup_iters)
+    parser.add_argument("--weight-decay",         type=float, default=cfg.weight_decay)
+    parser.add_argument("--grad-clip",            type=float, default=cfg.grad_clip)
+    parser.add_argument("--grad-norm-warn-threshold", type=float, default=cfg.grad_norm_warn_threshold)
     # Warm restart
-    parser.add_argument(
-        "--fresh-optimizer", action="store_true",
-        help="Warm restart: carga pesos pero descarta estado de Adam."
-    )
+    parser.add_argument("--fresh-optimizer", action="store_true")
     # Pérdida contrastiva
-    parser.add_argument(
-        "--contrastive-weight", type=float, default=cfg.contrastive_weight,
-        help="Peso de la pérdida contrastiva. 0 = desactivada. Recomendado: 0.005."
-    )
-    parser.add_argument(
-        "--contrastive-interval", type=int, default=cfg.contrastive_interval,
-        help="Cada cuántos pasos calcular la pérdida contrastiva."
-    )
-    parser.add_argument(
-        "--contrastive-temperature", type=float, default=cfg.contrastive_temperature,
-        help="Temperatura InfoNCE. Menor = más discriminativa. Default: 0.07."
-    )
-    # Paths / infra
-    parser.add_argument("--device",          type=str, default=cfg.device)
-    parser.add_argument("--precision",       type=str, default=cfg.precision, help="auto|fp32|fp16|bf16")
-    parser.add_argument("--run-name",        type=str, default=cfg.run_name)
-    parser.add_argument("--checkpoint-path", type=str, default=cfg.checkpoint_path)
-    parser.add_argument("--train-bin",       type=str, default=cfg.train_bin)
-    parser.add_argument("--val-bin",         type=str, default=cfg.val_bin)
-    parser.add_argument("--tokenizer-path",  type=str, default=cfg.tokenizer_path)
-    parser.add_argument("--output-root",     type=str, default=cfg.output_root)
-    parser.add_argument("--no-resume",       action="store_true")
+    parser.add_argument("--contrastive-weight",      type=float, default=cfg.contrastive_weight)
+    parser.add_argument("--contrastive-interval",    type=int,   default=cfg.contrastive_interval)
+    parser.add_argument("--contrastive-temperature", type=float, default=cfg.contrastive_temperature)
+    # Infra
+    parser.add_argument("--device",           type=str, default=cfg.device)
+    parser.add_argument("--precision",        type=str, default=cfg.precision)
+    parser.add_argument("--run-name",         type=str, default=cfg.run_name)
+    parser.add_argument("--checkpoint-path",  type=str, default=cfg.checkpoint_path)
+    parser.add_argument("--train-bin",        type=str, default=cfg.train_bin)
+    parser.add_argument("--val-bin",          type=str, default=cfg.val_bin)
+    parser.add_argument("--tokenizer-path",   type=str, default=cfg.tokenizer_path)
+    parser.add_argument("--output-root",      type=str, default=cfg.output_root)
+    parser.add_argument("--no-resume",        action="store_true")
     parser.add_argument("--skip-presentation", action="store_true")
 
     args = parser.parse_args()
@@ -1285,6 +1415,9 @@ def parse_args() -> TrainConfig:
 
     cfg.batch_size        = args.batch_size
     cfg.max_iters         = args.max_iters
+    cfg.lr_horizon        = args.lr_horizon
+    cfg.patience          = args.patience
+    cfg.min_delta         = args.min_delta
     cfg.eval_interval     = args.eval_interval
     cfg.save_interval     = args.save_interval
     cfg.eval_batches      = args.eval_batches
@@ -1292,26 +1425,27 @@ def parse_args() -> TrainConfig:
     cfg.umap_interval     = args.umap_interval
     cfg.umap_sample_size  = args.umap_sample_size
 
-    cfg.lr_max       = args.lr_max
-    cfg.lr_min       = args.lr_min
-    cfg.warmup_iters = args.warmup_iters
-    cfg.weight_decay = args.weight_decay
-    cfg.grad_clip    = args.grad_clip
+    cfg.lr_max                   = args.lr_max
+    cfg.lr_min                   = args.lr_min
+    cfg.warmup_iters             = args.warmup_iters
+    cfg.weight_decay             = args.weight_decay
+    cfg.grad_clip                = args.grad_clip
+    cfg.grad_norm_warn_threshold = args.grad_norm_warn_threshold
 
-    cfg.fresh_optimizer          = args.fresh_optimizer
-    cfg.contrastive_weight       = args.contrastive_weight
-    cfg.contrastive_interval     = args.contrastive_interval
-    cfg.contrastive_temperature  = args.contrastive_temperature
+    cfg.fresh_optimizer         = args.fresh_optimizer
+    cfg.contrastive_weight      = args.contrastive_weight
+    cfg.contrastive_interval    = args.contrastive_interval
+    cfg.contrastive_temperature = args.contrastive_temperature
 
-    cfg.device          = args.device
-    cfg.precision       = args.precision
-    cfg.run_name        = args.run_name
-    cfg.checkpoint_path = args.checkpoint_path
-    cfg.train_bin       = args.train_bin
-    cfg.val_bin         = args.val_bin
-    cfg.tokenizer_path  = args.tokenizer_path
-    cfg.output_root     = args.output_root
-    cfg.resume          = not args.no_resume
+    cfg.device           = args.device
+    cfg.precision        = args.precision
+    cfg.run_name         = args.run_name
+    cfg.checkpoint_path  = args.checkpoint_path
+    cfg.train_bin        = args.train_bin
+    cfg.val_bin          = args.val_bin
+    cfg.tokenizer_path   = args.tokenizer_path
+    cfg.output_root      = args.output_root
+    cfg.resume           = not args.no_resume
     cfg.auto_presentation = not args.skip_presentation
 
     return cfg
