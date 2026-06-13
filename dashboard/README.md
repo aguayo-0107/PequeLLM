@@ -11,6 +11,22 @@ para poder demostrarlo desde cualquier lado.
 > hace `load_model()` → `eval()` → genera. Los únicos comandos de `run.sh` que
 > sobreescriben el checkpoint son `train` y el default sin argumentos.
 
+## Modelos afinados (instrucciones) — flujo de demo
+
+El selector escanea `*.pth` de forma **recursiva** en `/workspace/data`, así que los
+modelos afinados que el fine-tuning guarda en `artifacts_instruction/<run>/best_instruction_checkpoint.pth`
+**aparecen solos** en el dropdown (etiquetados como *"Instruct ES (afinado) — <run>"*).
+
+Al elegir uno, el toggle **"Modo instrucción"** se activa automáticamente: el chat
+arma el prompt con el formato `### Instrucción / ### Respuesta` (el mismo del
+fine-tuning) y trata cada mensaje como una instrucción independiente.
+
+Flujo el día del demo:
+1. `Ctrl-c` al fine-tuning para detenerlo (el mejor checkpoint ya está guardado).
+2. Levantar/refrescar el dashboard (`./run.sh dashboard`) — como el código se monta
+   en vivo, basta refrescar el navegador para que aparezca el modelo afinado.
+3. Elegir el checkpoint *"Instruct ES (afinado)"* en el sidebar y chatear en español.
+
 ## Cómo correr en renna (vía SSH)
 
 ```bash

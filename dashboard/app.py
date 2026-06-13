@@ -39,6 +39,11 @@ from emb_gpt2 import select_device  # noqa: E402
 from generate_prompt import load_model, sample_next_token  # noqa: E402
 from chat.memory import build_chat_prompt, clean_output  # noqa: E402
 
+# Plantilla de instrucción en español (misma fuente que el fine-tuning, para
+# que el prompt en el chat coincida con lo que el modelo afinado aprendió).
+sys.path.insert(0, str(REPO_ROOT / "FineTuning"))
+from finetune_instruction import format_input as format_instruction_input  # noqa: E402
+
 
 DEFAULT_TOKENIZER = str(REPO_ROOT / "tokenizer-culturax-es-hf.json")
 # Carpeta donde el entrenamiento guarda los checkpoints dentro del contenedor.
@@ -46,21 +51,43 @@ DATA_DIR = Path(os.environ.get("PEQUELLM_DATA_DIR", "/workspace/data"))
 
 
 # ── Descubrimiento de checkpoints ───────────────────────────────────────────
+def is_instruction_checkpoint(path: str) -> bool:
+    """Heurística: ¿es un modelo afinado para instrucciones?"""
+    p = path.lower()
+    return "instruction" in p or "instruct" in p
+
+
+def _label_for(path: Path) -> str:
+    name = path.name.lower()
+    full = str(path).lower()
+    if is_instruction_checkpoint(full):
+        # Distinguir por la carpeta de la corrida (instruction_<fecha>).
+        return f"Instruct ES (afinado) — {path.parent.name}"
+    if "medium" in name or "med" in name:
+        return "GPT-2 Medium"
+    if "pesado" in name or "small" in name:
+        return "GPT-2 Small"
+    return path.name
+
+
 def discover_checkpoints() -> Dict[str, str]:
-    """Mapea 'etiqueta visible' -> ruta absoluta de cada .pth encontrado."""
+    """Mapea 'etiqueta visible' -> ruta absoluta de cada .pth encontrado.
+
+    Escanea DATA_DIR de forma recursiva (para detectar automáticamente los
+    modelos afinados en artifacts_instruction/<run>/) y la raíz del repo.
+    Ordena poniendo primero los modelos afinados (default para la demo).
+    """
+    paths = set()
+    if DATA_DIR.is_dir():
+        paths.update(DATA_DIR.rglob("*.pth"))
+    if REPO_ROOT.is_dir():
+        paths.update(REPO_ROOT.glob("*.pth"))
+
+    # Afinados primero, luego por nombre.
+    ordered = sorted(paths, key=lambda p: (not is_instruction_checkpoint(str(p)), str(p)))
     found: Dict[str, str] = {}
-    for directory in (DATA_DIR, REPO_ROOT):
-        if not directory.is_dir():
-            continue
-        for path in sorted(directory.glob("*.pth")):
-            name = path.name.lower()
-            if "medium" in name or "med" in name:
-                label = f"GPT-2 Medium"
-            elif "pesado" in name:
-                label = f"GPT-2 Small"
-            else:
-                label = path.name
-            found.setdefault(label, str(path))
+    for path in ordered:
+        found.setdefault(_label_for(path), str(path))
     return found
 
 
@@ -153,10 +180,16 @@ with st.sidebar:
     max_new_tokens = st.slider("Tokens a generar", 16, 400, 120, step=8)
     temperature = st.slider("Temperatura", 0.0, 1.5, 0.9, step=0.05)
     top_k = st.slider("top-k (0 = desactivado)", 0, 200, 50, step=5)
+    instruction_mode = st.checkbox(
+        "Modo instrucción (modelo afinado)", value=is_instruction_checkpoint(checkpoint_path),
+        help="Usa el formato '### Instrucción / ### Respuesta' con el que se afinó "
+             "el modelo. Se activa solo al elegir un checkpoint afinado. Cada mensaje "
+             "es una instrucción independiente (sin historial).",
+    )
     use_memory = st.checkbox(
-        "Memoria conversacional", value=True,
+        "Memoria conversacional", value=True, disabled=instruction_mode,
         help="Arma el prompt con los turnos recientes que quepan en la ventana "
-             "(formato Usuario:/Asistente:). Apagado = completación de un solo turno.",
+             "(formato Usuario:/Asistente:). Ignorado en modo instrucción.",
     )
 
     st.divider()
@@ -202,8 +235,18 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Construcción del prompt: con memoria (presupuesto de tokens) o un solo turno.
-    if use_memory:
+    # Construcción del prompt según el modo.
+    if instruction_mode:
+        # Modelo afinado: formato Alpaca en español, una instrucción por turno.
+        prompt_text = format_instruction_input({"instruction": prompt, "input": ""}) + "\n\n### Respuesta:\n"
+        prompt_ids = tokenizer.encode(prompt_text).ids
+        stats = {
+            "prompt_tokens": len(prompt_ids),
+            "budget": model.cfg.block_size,
+            "turns_included": 1,
+            "turns_total": len(st.session_state.messages),
+        }
+    elif use_memory:
         prompt_text, prompt_ids, stats = build_chat_prompt(
             messages=st.session_state.messages,
             tokenizer=tokenizer,
