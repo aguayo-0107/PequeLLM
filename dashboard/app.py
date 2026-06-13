@@ -141,7 +141,13 @@ with st.sidebar:
             "Ruta del checkpoint", value=str(DATA_DIR / "pequellm_medium_checkpoint.pth")
         )
 
-    tokenizer_path = st.text_input("Tokenizer", value=DEFAULT_TOKENIZER)
+    # Tokenizer fijo del proyecto: se muestra (para que se vea que es el nuestro)
+    # pero deshabilitado para que no se pueda cambiar ni romper.
+    tokenizer_path = DEFAULT_TOKENIZER
+    st.text_input(
+        "Tokenizer", value=Path(DEFAULT_TOKENIZER).name, disabled=True,
+        help="Tokenizer BPE en español del proyecto (entrenado sobre CulturaX). Fijo.",
+    )
 
     st.divider()
     max_new_tokens = st.slider("Tokens a generar", 16, 400, 120, step=8)
