@@ -8,6 +8,8 @@
 #     ./run.sh synth          # generar train.bin/val.bin sinteticos
 #     ./run.sh prepare-data   # correr Tokenizador/prepare_data/prepare_data.py (CulturaX, lento)
 #     ./run.sh train [args]   # entrenar pasando args extras a Emb_gptMed.py
+#     ./run.sh prepare-instr-es  # bajar Alpaca en espanol y generar splits (necesita red)
+#     ./run.sh finetune-instr [args]  # fine-tuning de instrucciones sobre el modelo Medium
 #     ./run.sh dashboard      # chat web (Streamlit) para probar el modelo, puerto 8501
 #     ./run.sh shell          # bash interactivo dentro del contenedor
 #
@@ -17,6 +19,7 @@
 #     CACHE_VOL  (default: pequellm-cache)
 #     RUNTIME    (auto: podman si esta, sino docker)
 #     DASHBOARD_PORT (default: 8501)
+#     MEDIUM_CKPT    (default: pequellm_medium_checkpoint.pth)  base para finetune-instr
 
 set -euo pipefail
 
@@ -154,6 +157,32 @@ case "$cmd" in
             python /workspace/repo/data.py
         ;;
 
+    prepare-instr-es)
+        ensure_image
+        ensure_volumes
+        # Descarga el dataset Alpaca en español y genera los splits
+        # instruction_es_{train,val,test}.json en FineTuning/data/ (necesita red).
+        "$RUNTIME" run "${common_run_args[@]}" "$IMAGE" \
+            python /workspace/repo/FineTuning/prepare_instruction_data_es.py "$@"
+        ;;
+
+    finetune-instr)
+        ensure_image
+        ensure_volumes
+        # Fine-tuning de instrucciones sobre el modelo Medium. Solo-lectura sobre
+        # el checkpoint base; escribe el modelo afinado en el volumen de datos.
+        # MEDIUM_CKPT permite apuntar a otro checkpoint base.
+        # Args extra se pasan tal cual (p. ej. --max-length 256 --batch-size 8 --max-epochs 50).
+        "$RUNTIME" run "${common_run_args[@]}" "$IMAGE" \
+            python /workspace/repo/FineTuning/finetune_instruction.py \
+                --base-checkpoint-path /workspace/data/"${MEDIUM_CKPT:-pequellm_medium_checkpoint.pth}" \
+                --train-json /workspace/repo/FineTuning/data/instruction_es_train.json \
+                --val-json   /workspace/repo/FineTuning/data/instruction_es_val.json \
+                --test-json  /workspace/repo/FineTuning/data/instruction_es_test.json \
+                --output-root /workspace/data/artifacts_instruction \
+                "$@"
+        ;;
+
     dashboard)
         ensure_image
         ensure_volumes
@@ -176,12 +205,12 @@ case "$cmd" in
         ;;
 
     -h|--help|help)
-        sed -n '2,19p' "$0" | sed 's/^# *//'
+        sed -n '2,22p' "$0" | sed 's/^# *//'
         ;;
 
     *)
         echo "ERROR: subcomando desconocido: '$cmd'" >&2
-        echo "       Usa: $0 [build|smoke|synth|prepare-data|train|dashboard|shell|help|pruebas|data]" >&2
+        echo "       Usa: $0 [build|smoke|synth|prepare-data|train|prepare-instr-es|finetune-instr|dashboard|shell|help|pruebas|data]" >&2
         exit 2
         ;;
 esac
