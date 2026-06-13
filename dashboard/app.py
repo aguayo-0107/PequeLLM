@@ -213,16 +213,18 @@ if prompt:
             )
             st.markdown(respuesta)
         else:
-            respuesta = st.write_stream(
-                stream_generate(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt_ids=prompt_ids,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_k=top_k,
-                    device=device,
+            with st.spinner("PequeLLM está escribiendo…"):
+                respuesta = "".join(
+                    stream_generate(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt_ids=prompt_ids,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_k=top_k,
+                        device=device,
+                    )
                 )
-            )
+            st.markdown(respuesta)
 
     st.session_state.messages.append({"role": "assistant", "content": respuesta})
