@@ -160,6 +160,7 @@ case "$cmd" in
         # Dashboard de chat (Streamlit). Solo-lectura sobre el checkpoint.
         # Publicamos el puerto para poder exponerlo con cloudflared/ngrok o
         # via SSH port-forwarding. Ver dashboard/README.md.
+        # Para que sobreviva a cerrar SSH/laptop, correrlo dentro de tmux.
         PORT="${DASHBOARD_PORT:-8501}"
         echo "[run.sh] Dashboard en http://localhost:${PORT} (Ctrl-C para salir)" >&2
         "$RUNTIME" run "${common_run_args[@]}" -p "${PORT}:8501" "$IMAGE" \
