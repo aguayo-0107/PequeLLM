@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Iterator, List
+from typing import Dict, List
 
 import streamlit as st
 import torch
@@ -37,6 +37,7 @@ for _p in (str(EMB_DIR), str(REPO_ROOT)):
 
 from emb_gpt2 import select_device  # noqa: E402
 from generate_prompt import load_model, sample_next_token  # noqa: E402
+from chat.memory import build_chat_prompt, clean_output  # noqa: E402
 
 
 DEFAULT_TOKENIZER = str(REPO_ROOT / "tokenizer-culturax-es-hf.json")
@@ -54,9 +55,9 @@ def discover_checkpoints() -> Dict[str, str]:
         for path in sorted(directory.glob("*.pth")):
             name = path.name.lower()
             if "medium" in name or "med" in name:
-                label = f"GPT-2 Medium — {path.name}"
-            elif "small" in name:
-                label = f"GPT-2 Small — {path.name}"
+                label = f"GPT-2 Medium"
+            elif "pesado" in name:
+                label = f"GPT-2 Small"
             else:
                 label = path.name
             found.setdefault(label, str(path))
@@ -76,8 +77,11 @@ def count_parameters(model) -> int:
 
 
 # ── Generación con streaming token-a-token ──────────────────────────────────
+STOP_SEQUENCES = ("\nUsuario:", "\nAsistente:", "\n###")
+
+
 @torch.no_grad()
-def stream_generate(
+def generate_reply(
     model,
     tokenizer: Tokenizer,
     prompt_ids: List[int],
@@ -85,47 +89,38 @@ def stream_generate(
     temperature: float,
     top_k: int,
     device: str,
-) -> Iterator[str]:
-    """Genera tokens uno por uno y emite el texto nuevo decodificado.
+    eos_id: int | None = None,
+) -> str:
+    """Genera la respuesta completa (sólo la parte nueva, ya limpia).
 
-    Decodifica sólo la parte generada (no el prompt) para que en el chat se vea
-    únicamente la respuesta del modelo.
+    Para de generar cuando: alcanza ``max_new_tokens``, el modelo emite ``</s>``
+    (eos_id) o aparece el inicio de un nuevo turno (``\\nUsuario:`` etc.).
     """
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     generated: List[int] = []
-    prev_text = ""
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -model.cfg.block_size:]
         logits, _ = model(idx_cond)
         next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_k=top_k)
+        token_id = int(next_token.item())
+        if eos_id is not None and token_id == eos_id:
+            break
         idx = torch.cat((idx, next_token), dim=1)
-        generated.append(int(next_token.item()))
+        generated.append(token_id)
         text = tokenizer.decode(generated)
-        delta = text[len(prev_text):]
-        if delta:
-            prev_text = text
-            yield delta
-
-
-def build_prompt(messages: List[Dict[str, str]], include_history: bool) -> str:
-    """Construye el texto que se le da al modelo.
-
-    - Sin historial: sólo el último mensaje del usuario (completación pura).
-    - Con historial: concatena los turnos previos como texto plano. El modelo
-      no tiene memoria real; esto es sólo más contexto para la completación y
-      la ventana se recorta sola por block_size.
-    """
-    if not include_history:
-        return messages[-1]["content"]
-    return "\n".join(m["content"] for m in messages)
+        # Parada temprana si el modelo empezó a escribir un nuevo turno.
+        if any(stop in text for stop in STOP_SEQUENCES):
+            break
+    return clean_output(tokenizer.decode(generated))
 
 
 # ── UI ──────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="PequeLLM Chat", page_icon="💬", layout="centered")
 st.title("💬 PequeLLM")
 st.caption(
-    "Demo: el modelo **no conversa**, hace *completación de tokens*. "
-    "Escribe un inicio de texto y el modelo lo continúa."
+    "Demo: por dentro el modelo hace *completación de tokens*. Con **memoria "
+    "conversacional** se le arman los turnos recientes que caben en su ventana "
+    "para simular un chat. No tiene memoria real ni fue afinado para conversar."
 )
 
 device = select_device("auto")
@@ -152,9 +147,10 @@ with st.sidebar:
     max_new_tokens = st.slider("Tokens a generar", 16, 400, 120, step=8)
     temperature = st.slider("Temperatura", 0.0, 1.5, 0.9, step=0.05)
     top_k = st.slider("top-k (0 = desactivado)", 0, 200, 50, step=5)
-    include_history = st.checkbox(
-        "Incluir conversación como contexto", value=False,
-        help="El modelo no tiene memoria; esto sólo concatena los turnos previos como texto.",
+    use_memory = st.checkbox(
+        "Memoria conversacional", value=True,
+        help="Arma el prompt con los turnos recientes que quepan en la ventana "
+             "(formato Usuario:/Asistente:). Apagado = completación de un solo turno.",
     )
 
     st.divider()
@@ -192,14 +188,31 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-prompt = st.chat_input("Escribe un inicio de texto…")
+eos_id = tokenizer.token_to_id("</s>")
+
+prompt = st.chat_input("Escribe un mensaje…")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    prompt_text = build_prompt(st.session_state.messages, include_history)
-    prompt_ids = tokenizer.encode(prompt_text).ids
+    # Construcción del prompt: con memoria (presupuesto de tokens) o un solo turno.
+    if use_memory:
+        prompt_text, prompt_ids, stats = build_chat_prompt(
+            messages=st.session_state.messages,
+            tokenizer=tokenizer,
+            block_size=model.cfg.block_size,
+            reserved_generation_tokens=max_new_tokens,
+        )
+    else:
+        prompt_text = prompt
+        prompt_ids = tokenizer.encode(prompt_text).ids
+        stats = {
+            "prompt_tokens": len(prompt_ids),
+            "budget": model.cfg.block_size,
+            "turns_included": 1,
+            "turns_total": len(st.session_state.messages),
+        }
 
     with st.chat_message("assistant"):
         if not prompt_ids:
@@ -214,17 +227,36 @@ if prompt:
             st.markdown(respuesta)
         else:
             with st.spinner("PequeLLM está escribiendo…"):
-                respuesta = "".join(
-                    stream_generate(
-                        model=model,
-                        tokenizer=tokenizer,
-                        prompt_ids=prompt_ids,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        top_k=top_k,
-                        device=device,
-                    )
+                respuesta = generate_reply(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_ids=prompt_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    device=device,
+                    eos_id=eos_id,
                 )
+            if not respuesta:
+                respuesta = "_(El modelo no generó texto útil. Prueba a subir 'Tokens a generar' o cambiar el prompt.)_"
             st.markdown(respuesta)
+
+    # Panel de depuración: muestra el mecanismo de memoria.
+    with st.expander("🔍 Depuración (prompt y memoria)"):
+        over = stats["prompt_tokens"] > stats["budget"]
+        st.markdown(
+            f"- **Mensajes en sesión**: {stats['turns_total']}\n"
+            f"- **Turnos incluidos en el prompt**: {stats['turns_included']}\n"
+            f"- **Tokens del prompt**: {stats['prompt_tokens']} / "
+            f"presupuesto {stats['budget']} {'⚠️ excede' if over else '✅'}\n"
+            f"- **block_size**: {model.cfg.block_size} · **reservado para respuesta**: {max_new_tokens}"
+        )
+        if stats["budget"] <= 32:
+            st.warning(
+                "El presupuesto para historial es muy pequeño. Baja 'Tokens a generar' "
+                "para dejar más espacio a la memoria (típico con block_size=128)."
+            )
+        st.caption("Prompt exacto enviado al modelo:")
+        st.code(prompt_text, language="text")
 
     st.session_state.messages.append({"role": "assistant", "content": respuesta})
