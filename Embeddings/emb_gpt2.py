@@ -191,8 +191,19 @@ class GPTModel(nn.Module):
             print("[INFO] Weight tying activado: lm_head comparte pesos con token_embedding")
 
     def forward(
-        self, idx: torch.Tensor, targets: torch.Tensor | None = None
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        last_token_only: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        last_token_only=True  → proyecta lm_head solo sobre la última posición.
+            Optimización de inferencia: al generar token a token solo se usa la
+            última posición, así que evitamos la proyección a vocab_size (~50k)
+            sobre toda la ventana. Devuelve logits de shape (B, 1, vocab_size),
+            por lo que `logits[:, -1, :]` sigue funcionando en los callers.
+        last_token_only=False → comportamiento original (logits de toda la sec.).
+        """
         bsz, seq_len = idx.shape
         pos = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
         tok_emb = self.token_embedding_table(idx)
@@ -200,6 +211,8 @@ class GPTModel(nn.Module):
         x = self.emb_dropout(tok_emb + pos_emb)
         x = self.blocks(x)
         x = self.ln_f(x)
+        if last_token_only:
+            x = x[:, -1:, :]
         logits = self.lm_head(x)
 
         loss = None
