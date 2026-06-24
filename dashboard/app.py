@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List
 
@@ -103,6 +105,27 @@ def count_parameters(model) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def resolve_autocast(device: str, precision: str = "auto"):
+    """Context manager de autocast para inferencia. En ROCm el device es 'cuda'.
+
+    precision: auto|bf16|fp16|fp32. auto → bf16 si la GPU lo soporta, si no fp16.
+    Devuelve (context_manager, nombre_dtype).
+    """
+    precision = (precision or "auto").lower().strip()
+    if device != "cuda" or precision == "fp32":
+        return nullcontext(), "fp32"
+    if precision == "fp16":
+        dtype = torch.float16
+    elif precision == "bf16":
+        dtype = torch.bfloat16
+    else:  # auto
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype), str(dtype).replace("torch.", "")
+
+
 # ── Generación con streaming token-a-token ──────────────────────────────────
 STOP_SEQUENCES = ("\nUsuario:", "\nAsistente:", "\n###")
 
@@ -117,17 +140,26 @@ def generate_reply(
     top_k: int,
     device: str,
     eos_id: int | None = None,
-) -> str:
+    autocast_ctx=None,
+) -> tuple[str, Dict]:
     """Genera la respuesta completa (sólo la parte nueva, ya limpia).
 
     Para de generar cuando: alcanza ``max_new_tokens``, el modelo emite ``</s>``
     (eos_id) o aparece el inicio de un nuevo turno (``\\nUsuario:`` etc.).
+
+    Devuelve ``(texto_limpio, perf)`` donde perf trae tiempo y tokens/seg.
     """
+    if autocast_ctx is None:
+        autocast_ctx = nullcontext()
     idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     generated: List[int] = []
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -model.cfg.block_size:]
-        logits, _ = model(idx_cond)
+        with autocast_ctx:
+            logits, _ = model(idx_cond, last_token_only=True)
         next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_k=top_k)
         token_id = int(next_token.item())
         if eos_id is not None and token_id == eos_id:
@@ -138,7 +170,17 @@ def generate_reply(
         # Parada temprana si el modelo empezó a escribir un nuevo turno.
         if any(stop in text for stop in STOP_SEQUENCES):
             break
-    return clean_output(tokenizer.decode(generated))
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+    n_tok = len(generated)
+    perf = {
+        "elapsed_s": elapsed,
+        "tokens_generated": n_tok,
+        "tokens_per_sec": (n_tok / elapsed) if elapsed > 0 else float("nan"),
+        "dtype": amp_dtype,
+    }
+    return clean_output(tokenizer.decode(generated)), perf
 
 
 # ── UI ──────────────────────────────────────────────────────────────────────
@@ -151,6 +193,8 @@ st.caption(
 )
 
 device = select_device("auto")
+# autocast bf16 en inferencia (en ROCm el device se reporta como "cuda").
+autocast_ctx, amp_dtype = resolve_autocast(device, "auto")
 checkpoints = discover_checkpoints()
 
 with st.sidebar:
@@ -263,6 +307,7 @@ if prompt:
             "turns_total": len(st.session_state.messages),
         }
 
+    perf = None
     with st.chat_message("assistant"):
         if not prompt_ids:
             respuesta = "_(El prompt no produjo tokens. Intenta con otro texto.)_"
@@ -276,7 +321,7 @@ if prompt:
             st.markdown(respuesta)
         else:
             with st.spinner("PequeLLM está escribiendo…"):
-                respuesta = generate_reply(
+                respuesta, perf = generate_reply(
                     model=model,
                     tokenizer=tokenizer,
                     prompt_ids=prompt_ids,
@@ -285,6 +330,7 @@ if prompt:
                     top_k=top_k,
                     device=device,
                     eos_id=eos_id,
+                    autocast_ctx=autocast_ctx,
                 )
             if not respuesta:
                 respuesta = "_(El modelo no generó texto útil. Prueba a subir 'Tokens a generar' o cambiar el prompt.)_"
@@ -304,6 +350,13 @@ if prompt:
             st.warning(
                 "El presupuesto para historial es muy pequeño. Baja 'Tokens a generar' "
                 "para dejar más espacio a la memoria (típico con block_size=128)."
+            )
+        if perf is not None:
+            st.markdown(
+                "**⚡ Rendimiento de generación**\n"
+                f"- **Tiempo total**: {perf['elapsed_s']:.3f} s\n"
+                f"- **Tokens generados**: {perf['tokens_generated']}\n"
+                f"- **Tokens/seg**: {perf['tokens_per_sec']:.1f}"
             )
         st.caption("Prompt exacto enviado al modelo:")
         st.code(prompt_text, language="text")
