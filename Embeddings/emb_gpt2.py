@@ -118,15 +118,41 @@ class Head(nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, past_kv=None, use_cache: bool = False):
+        """
+        past_kv: (k_cache, v_cache) de pasos anteriores, o None.
+        use_cache=False → comportamiento original (devuelve solo el tensor).
+        use_cache=True  → devuelve (out, (k, v)) con el k/v acumulado de esta capa.
+
+        El factor de escala se mantiene en `channels ** -0.5` (channels = n_embd),
+        igual que en el entrenamiento, para no alterar los logits del modelo.
+        """
         bsz, seq_len, channels = x.shape
         k = self.key(x)
         q = self.query(x)
+        v = self.value(x)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=1)
+            v = torch.cat((past_v, v), dim=1)
+
+        # Cuántos tokens había ya en el cache (0 en prefill / entrenamiento).
+        t_past = k.shape[1] - seq_len
+
         att = q @ k.transpose(-2, -1) * (channels ** -0.5)
-        att = att.masked_fill(self.tril[:seq_len, :seq_len] == 0, float("-inf"))
+        # Máscara causal: las `seq_len` queries (en posiciones t_past..t_past+seq_len-1)
+        # pueden mirar todas las keys 0..t_past+seq_len-1 hasta su propia posición.
+        att = att.masked_fill(
+            self.tril[t_past:t_past + seq_len, :t_past + seq_len] == 0, float("-inf")
+        )
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
-        return att @ self.value(x)
+        out = att @ v
+
+        if use_cache:
+            return out, (k, v)
+        return out
 
 
 class MultiHeadAttention(nn.Module):
@@ -140,9 +166,20 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(n_embd, n_embd)
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.proj(torch.cat([head(x) for head in self.heads], dim=-1))
-        return self.resid_dropout(out)
+    def forward(self, x: torch.Tensor, past_kv=None, use_cache: bool = False):
+        if not use_cache:
+            out = self.proj(torch.cat([head(x) for head in self.heads], dim=-1))
+            return self.resid_dropout(out)
+
+        head_outs = []
+        new_kv = []
+        for i, head in enumerate(self.heads):
+            past_i = past_kv[i] if past_kv is not None else None
+            out_i, kv_i = head(x, past_i, use_cache=True)
+            head_outs.append(out_i)
+            new_kv.append(kv_i)
+        out = self.proj(torch.cat(head_outs, dim=-1))
+        return self.resid_dropout(out), new_kv
 
 
 class FeedForward(nn.Module):
@@ -167,9 +204,15 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.sa(self.ln1(x))
-        return x + self.ffwd(self.ln2(x))
+    def forward(self, x: torch.Tensor, past_kv=None, use_cache: bool = False):
+        if not use_cache:
+            x = x + self.sa(self.ln1(x))
+            return x + self.ffwd(self.ln2(x))
+
+        attn_out, new_kv = self.sa(self.ln1(x), past_kv, use_cache=True)
+        x = x + attn_out
+        x = x + self.ffwd(self.ln2(x))
+        return x, new_kv
 
 
 class GPTModel(nn.Module):
@@ -195,7 +238,9 @@ class GPTModel(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         last_token_only: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        past: list | None = None,
+        use_cache: bool = False,
+    ):
         """
         last_token_only=True  → proyecta lm_head solo sobre la última posición.
             Optimización de inferencia: al generar token a token solo se usa la
@@ -203,23 +248,61 @@ class GPTModel(nn.Module):
             sobre toda la ventana. Devuelve logits de shape (B, 1, vocab_size),
             por lo que `logits[:, -1, :]` sigue funcionando en los callers.
         last_token_only=False → comportamiento original (logits de toda la sec.).
+
+        use_cache=False (default) → comportamiento original EXACTO; devuelve
+            (logits, loss). No toca nada del entrenamiento.
+        use_cache=True  → ruta de inferencia con KV cache. `past` es una lista
+            (una entrada por capa) con el k/v acumulado, o None en el primer paso
+            (prefill). Devuelve (logits, loss, new_past). El embedding de posición
+            usa el offset real del token dentro de la secuencia (no arange(0,T)),
+            que se deduce de la longitud del cache.
         """
         bsz, seq_len = idx.shape
-        pos = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
+
+        if not use_cache:
+            pos = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
+            tok_emb = self.token_embedding_table(idx)
+            pos_emb = self.position_embedding_table(pos)
+            x = self.emb_dropout(tok_emb + pos_emb)
+            x = self.blocks(x)
+            x = self.ln_f(x)
+            if last_token_only:
+                x = x[:, -1:, :]
+            logits = self.lm_head(x)
+
+            loss = None
+            if targets is not None:
+                b, t, c = logits.shape
+                loss = F.cross_entropy(logits.view(b * t, c), targets.view(b * t))
+            return logits, loss
+
+        # ── Ruta con KV cache ────────────────────────────────────────────────
+        # Offset de posición = nº de tokens ya en el cache (0 en el prefill).
+        # past[0][0][0] = tensor k de la capa 0, cabeza 0 → shape (B, T_cache, hs).
+        pos_offset = 0 if past is None else past[0][0][0].shape[1]
+        if pos_offset + seq_len > self.cfg.block_size:
+            raise ValueError(
+                f"KV cache: la secuencia ({pos_offset + seq_len}) excede block_size "
+                f"({self.cfg.block_size}). Los embeddings de posición aprendidos no "
+                f"existen más allá de block_size."
+            )
+
+        pos = torch.arange(pos_offset, pos_offset + seq_len, dtype=torch.long, device=idx.device)
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(pos)
         x = self.emb_dropout(tok_emb + pos_emb)
-        x = self.blocks(x)
+
+        new_past = []
+        for layer_idx, block in enumerate(self.blocks):
+            past_i = past[layer_idx] if past is not None else None
+            x, kv = block(x, past_i, use_cache=True)
+            new_past.append(kv)
+
         x = self.ln_f(x)
         if last_token_only:
             x = x[:, -1:, :]
         logits = self.lm_head(x)
-
-        loss = None
-        if targets is not None:
-            b, t, c = logits.shape
-            loss = F.cross_entropy(logits.view(b * t, c), targets.view(b * t))
-        return logits, loss
+        return logits, None, new_past
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:

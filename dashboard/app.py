@@ -141,35 +141,64 @@ def generate_reply(
     device: str,
     eos_id: int | None = None,
     autocast_ctx=None,
+    use_cache: bool = True,
 ) -> tuple[str, Dict]:
     """Genera la respuesta completa (sólo la parte nueva, ya limpia).
 
     Para de generar cuando: alcanza ``max_new_tokens``, el modelo emite ``</s>``
     (eos_id) o aparece el inicio de un nuevo turno (``\\nUsuario:`` etc.).
 
-    Devuelve ``(texto_limpio, perf)`` donde perf trae tiempo y tokens/seg.
+    use_cache=True usa el KV cache (mucho más rápido: no reprocesa toda la
+    ventana en cada token). use_cache=False es el camino original, útil para
+    comparar resultados. Devuelve ``(texto_limpio, perf)``.
     """
     if autocast_ctx is None:
         autocast_ctx = nullcontext()
-    idx = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    block_size = model.cfg.block_size
+    # El prompt no puede exceder block_size (posiciones aprendidas hasta ahí).
+    cond = torch.tensor([prompt_ids[-block_size:]], dtype=torch.long, device=device)
     generated: List[int] = []
+
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    for _ in range(max_new_tokens):
-        idx_cond = idx[:, -model.cfg.block_size:]
+
+    if use_cache:
+        # Prefill: una sola pasada con todo el prompt; guardamos el cache.
         with autocast_ctx:
-            logits, _ = model(idx_cond, last_token_only=True)
-        next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_k=top_k)
-        token_id = int(next_token.item())
-        if eos_id is not None and token_id == eos_id:
-            break
-        idx = torch.cat((idx, next_token), dim=1)
-        generated.append(token_id)
-        text = tokenizer.decode(generated)
-        # Parada temprana si el modelo empezó a escribir un nuevo turno.
-        if any(stop in text for stop in STOP_SEQUENCES):
-            break
+            logits, _, past = model(cond, last_token_only=True, use_cache=True)
+        cur_len = cond.shape[1]
+        for _ in range(max_new_tokens):
+            next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_k=top_k)
+            token_id = int(next_token.item())
+            if eos_id is not None and token_id == eos_id:
+                break
+            generated.append(token_id)
+            if any(stop in tokenizer.decode(generated) for stop in STOP_SEQUENCES):
+                break
+            if cur_len >= block_size:
+                # Límite del modelo (posiciones aprendidas): no podemos extender
+                # el cache más allá de block_size. Paramos en vez de dar resultados
+                # sutilmente incorrectos.
+                break
+            with autocast_ctx:
+                logits, _, past = model(next_token, last_token_only=True, past=past, use_cache=True)
+            cur_len += 1
+    else:
+        idx = cond
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            with autocast_ctx:
+                logits, _ = model(idx_cond, last_token_only=True)
+            next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_k=top_k)
+            token_id = int(next_token.item())
+            if eos_id is not None and token_id == eos_id:
+                break
+            idx = torch.cat((idx, next_token), dim=1)
+            generated.append(token_id)
+            if any(stop in tokenizer.decode(generated) for stop in STOP_SEQUENCES):
+                break
+
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
@@ -178,7 +207,7 @@ def generate_reply(
         "elapsed_s": elapsed,
         "tokens_generated": n_tok,
         "tokens_per_sec": (n_tok / elapsed) if elapsed > 0 else float("nan"),
-        "dtype": amp_dtype,
+        "kv_cache": use_cache,
     }
     return clean_output(tokenizer.decode(generated)), perf
 
@@ -234,6 +263,12 @@ with st.sidebar:
         "Memoria conversacional", value=True, disabled=instruction_mode,
         help="Arma el prompt con los turnos recientes que quepan en la ventana "
              "(formato Usuario:/Asistente:). Ignorado en modo instrucción.",
+    )
+    use_cache = st.checkbox(
+        "KV cache (más rápido)", value=True,
+        help="Reusa los key/value ya calculados en vez de reprocesar toda la "
+             "ventana en cada token. Desactívalo para comparar velocidad/salida "
+             "contra el camino original (útil con Temperatura=0).",
     )
 
     st.divider()
@@ -331,6 +366,7 @@ if prompt:
                     device=device,
                     eos_id=eos_id,
                     autocast_ctx=autocast_ctx,
+                    use_cache=use_cache,
                 )
             if not respuesta:
                 respuesta = "_(El modelo no generó texto útil. Prueba a subir 'Tokens a generar' o cambiar el prompt.)_"
@@ -356,7 +392,8 @@ if prompt:
                 "**⚡ Rendimiento de generación**\n"
                 f"- **Tiempo total**: {perf['elapsed_s']:.3f} s\n"
                 f"- **Tokens generados**: {perf['tokens_generated']}\n"
-                f"- **Tokens/seg**: {perf['tokens_per_sec']:.1f}"
+                f"- **Tokens/seg**: {perf['tokens_per_sec']:.1f}\n"
+                f"- **KV cache**: {'✅ activado' if perf['kv_cache'] else '❌ desactivado'}"
             )
         st.caption("Prompt exacto enviado al modelo:")
         st.code(prompt_text, language="text")
